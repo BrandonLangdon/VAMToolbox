@@ -47,9 +47,9 @@ This release adds a high-level pipeline API, a desktop GUI (Tomo), large-part/hi
 
    CUDA capability detection and auto-tuning of run parameters, with a CPU fallback.
 
-6. ASTRA backend and standalone install
+6. Native install, ASTRA backend, and a one-command installer (conda deprecated)
 
-   VAMToolbox uses the `ASTRA Toolbox <https://astra-toolbox.com>`_ as its CUDA tomography backend for the projection/reconstruction operators. ASTRA no longer has to come from conda — it can be installed as a standalone, CUDA-bundled wheel downloaded directly from the `ASTRA Toolbox site <https://astra-toolbox.com/docs/install.html>`_ (or its `GitHub releases <https://github.com/astra-toolbox/astra-toolbox/releases>`_). This enables a plain ``pip``/venv setup on **Python 3.13** (see ``requirements-py313.txt``) without a conda environment, and is how the bundled Tomo runtime ships ASTRA. See `Installation`_.
+   VAMToolbox uses the `ASTRA Toolbox <https://astra-toolbox.com>`_ as its CUDA tomography backend for the projection/reconstruction operators. **conda is now deprecated** as the install path; VAMToolbox installs natively into a plain ``pip``/venv environment on **Python 3.13**. ASTRA is installed from the standalone, CUDA-bundled download on the `ASTRA Toolbox site <https://astra-toolbox.com/downloads/>`_ rather than a conda channel. A new ``install.ps1`` script at the repo root does the whole setup in one command — creates the venv, downloads and installs ASTRA (and its VC++ redistributable), installs ``requirements-py313.txt`` and VAMToolbox, and verifies CUDA. This is also how the bundled Tomo runtime ships ASTRA. See `Installation`_.
 
 7. Cleanup and packaging
 
@@ -103,24 +103,49 @@ For futher details of the algebraic representation, refers to the supplementary 
 Installation
 ------------
 
-To install VAMToolbox, enter the command below in the `Anaconda <https://www.anaconda.com/products/distribution>`_ or `Miniconda <https://docs.conda.io/en/latest/miniconda.html>`_ prompt::
+*NOTE: This toolbox is currently only compatible with Windows OS, and requires Python 3.13.*
+
+As of 3.0.0, VAMToolbox installs natively into a plain Python virtual environment — **conda is no longer required** (see `Deprecated: conda`_ below).
+
+**Recommended: one-command install**
+
+From a checkout of this repository, run::
+
+   powershell -ExecutionPolicy Bypass -File install.ps1
+
+``install.ps1`` does everything end-to-end: it finds your Python 3.13, creates a virtual environment (``.venv``), downloads the standalone CUDA-bundled ASTRA build from the `ASTRA Toolbox downloads <https://astra-toolbox.com/downloads/>`_, installs it (plus the bundled VC++ redistributable), installs all Python requirements, installs VAMToolbox itself, and verifies that ``astra.use_cuda()`` works. Re-running it reuses the existing environment.
+
+Useful flags: ``-SkipTorch`` (smaller install — ``torch`` is only needed for the pyTorch ray-tracing / algebraic propagators), ``-AstraZip <path>`` (use an already-downloaded ASTRA zip for offline installs), and ``-VenvPath <dir>``.
+
+When it finishes, activate the environment with ``.venv\Scripts\Activate.ps1``.
+
+**Manual install**
+
+If you prefer to do it by hand:
+
+1. Create and activate a Python 3.13 virtual environment::
+
+      python -m venv .venv
+      .venv\Scripts\activate
+
+2. Install ASTRA. Download ``astra-toolbox-2.4.1-python313-win-x64.zip`` from the `ASTRA Toolbox downloads <https://astra-toolbox.com/downloads/>`_, unpack it, run the included ``vc_redist.x64.exe``, and pip-install the ``.whl`` inside::
+
+      pip install astra_toolbox-2.4.1-cp313-cp313-win_amd64.whl
+
+   *Note:* ``pip install astra-toolbox`` from PyPI is **not** sufficient on Windows (PyPI ships Linux-only wheels) — use the standalone wheel from the ASTRA download above.
+
+3. Install the remaining requirements and VAMToolbox::
+
+      pip install -r requirements-py313.txt
+      pip install -e .
+
+``astra.use_cuda()`` should return ``True`` on a CUDA-capable NVIDIA GPU.
+
+Deprecated: conda
+~~~~~~~~~~~~~~~~~~
+The previous conda packages are deprecated and no longer the supported install path. The native install above replaces::
 
    conda install vamtoolbox -c vamtoolbox -c conda-forge -c astra-toolbox
-
-*NOTE: This command is different than what Anaconda.org suggests. This is because to properly install the dependencies you must tell conda to search in the astra-toolbox and vamtoolbox channels (in addition to the conda-forge channel, this is a default channel but is added to be explicit).*
-
-*NOTE: This toolbox is currently only compatible with Windows OS.*
-
-**Standalone (pip / venv, Python 3.13) — without conda**
-
-As of 3.0.0 you can run VAMToolbox in a plain virtual environment. The only dependency that is not on PyPI for Windows is ASTRA, which is installed from a standalone, CUDA-bundled wheel downloaded directly from the `ASTRA Toolbox site <https://astra-toolbox.com/docs/install.html>`_ (or its `GitHub releases <https://github.com/astra-toolbox/astra-toolbox/releases>`_)::
-
-   python -m venv .venv
-   .venv\Scripts\activate
-   pip install astra_toolbox-<version>-cp313-cp313-win_amd64.whl   # standalone wheel from the ASTRA site
-   pip install -r requirements-py313.txt
-
-``astra.use_cuda()`` should return ``True`` on a CUDA-capable GPU. Note that ``pip install astra-toolbox`` from PyPI is **not** sufficient on Windows (PyPI ships Linux-only wheels) — use the standalone wheel from the ASTRA site. ``torch`` is optional and is not required for the OSMO/BCLP + ASTRA path.
 
 For more information, refer to the `installation documentation <https://vamtoolbox.readthedocs.io/en/latest/_docs/gettingstarted.html>`_.
 
