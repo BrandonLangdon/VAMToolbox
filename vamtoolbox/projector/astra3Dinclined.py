@@ -9,7 +9,7 @@ class astra3Dinclined:
         self.nX, self.nY, self.nZ = target.shape
         self.angles_rad = np.deg2rad(params["angles"])
         inclination_angle = np.deg2rad(params["inclination_angle"])
-        self.cuda_available = astra.astra.use_cuda()
+        self.cuda_available = astra.use_cuda()
 
         # From samples/python/s005_3d_geometry.py
         # create_proj_geom('parallel3d_vec', det_row_count, det_col_count, V):

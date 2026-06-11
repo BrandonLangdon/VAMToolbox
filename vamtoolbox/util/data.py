@@ -96,21 +96,29 @@ def filterTargetOSMO(x: np.ndarray, filter_name: str):
     elif filter_name is None:
         fourier_filter[:] = 1
 
-    x_FT = scipy.fft.fftshift(fft2(x, axes=(0, 1)), axes=(0, 1))
     if x.ndim == 2:
+        x_FT = scipy.fft.fftshift(fft2(x, axes=(0, 1)), axes=(0, 1))
         x_filtered = ifft2(
             scipy.fft.ifftshift(np.multiply(x_FT, fourier_filter), axes=(0, 1)),
             axes=(0, 1),
         )
-    else:
-        x_filtered = ifft2(
-            scipy.fft.ifftshift(
-                np.multiply(x_FT, fourier_filter[:, :, np.newaxis]), axes=(0, 1)
-            ),
-            axes=(0, 1),
-        )  # [:,:,np.newaxis]
+        return x_filtered.astype(float)
 
-    return x_filtered.astype(float)
+    # 3D: the (0,1)-axes FFT is independent per z-slice, so filter in z-blocks to
+    # bound the complex temp (a full-volume complex128 FFT is ~16 bytes/voxel x
+    # several copies -> tens of GB at high resolution).  Output is real float32.
+    n_z = x.shape[2]
+    out = np.empty(x.shape, dtype=np.float32)
+    ff = fourier_filter[:, :, np.newaxis]
+    z_blk = max(1, min(n_z, 32))
+    for z0 in range(0, n_z, z_blk):
+        z1 = min(z0 + z_blk, n_z)
+        blk_FT = scipy.fft.fftshift(fft2(x[:, :, z0:z1], axes=(0, 1)), axes=(0, 1))
+        blk_f = ifft2(
+            scipy.fft.ifftshift(np.multiply(blk_FT, ff), axes=(0, 1)), axes=(0, 1)
+        )
+        out[:, :, z0:z1] = blk_f.real.astype(np.float32)
+    return out
 
 
 def filterTargetBCLP(real_space_array: np.ndarray, filter_name: str):

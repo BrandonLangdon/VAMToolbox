@@ -10,6 +10,76 @@ import numpy as np
 import vamtoolbox
 
 
+class Projector3DParallelCUDAAstraChunked:
+    """astra CUDA parallel-3D projector that streams the volume to the GPU in
+    blocks of z-slices, so peak VRAM is bounded by the chunk size instead of the
+    full N^3 volume.  Parallel-beam geometry is z-separable (each z-slice -> one
+    detector row), so chunked == non-chunked numerically.
+
+    chunk size is auto-sized to VRAM_BUDGET_BYTES.  When the whole volume fits in
+    one chunk this is identical to Projector3DParallelCUDAAstra (no overhead).
+    Only the non-inclined parallel3d case is chunked.
+    """
+
+    VRAM_BUDGET_BYTES = 4_000_000_000  # ~4 GB working set per chunk on the GPU
+
+    def __init__(self, target_geo, proj_geo):
+        self.target_geo = target_geo
+        self.proj_geo = proj_geo
+        self.nX, self.nY, self.nZ = target_geo.nX, target_geo.nY, target_geo.nZ
+        self.nT = target_geo.nX
+        self.nA = proj_geo.angles.size
+        self.angles_rad = np.deg2rad(proj_geo.angles)
+        if self.proj_geo.absorption_coeff is not None:
+            # store in astra order (nZ, nY, nX) to match the transposed volume
+            self.proj_geo.absorption_mask = np.transpose(self.proj_geo.absorption_mask)
+
+        # per-z-slice GPU cost: volume slice + its sinogram row + ~2x texture
+        per_slice = self.nX * self.nY * 4 * 3 + self.nA * self.nX * 4
+        self.z_chunk = int(max(1, min(self.nZ, self.VRAM_BUDGET_BYTES // per_slice)))
+
+    def _geoms(self, n_rows):
+        vol_geom = astra.create_vol_geom(self.nX, self.nY, n_rows)
+        proj_geom = astra.create_proj_geom(
+            "parallel3d", 1.0, 1.0, n_rows, self.nT, self.angles_rad
+        )
+        return vol_geom, proj_geom
+
+    def forward(self, target):
+        """b = Ax, streamed over z-chunks."""
+        x = np.transpose(vamtoolbox.util.data.clipToCircle(target))   # (nZ, nY, nX)
+        if self.proj_geo.absorption_coeff is not None:
+            x = self.proj_geo.absorption_mask * x
+        b = np.empty((self.nZ, self.nA, self.nX), dtype=np.float32)
+        for z0 in range(0, self.nZ, self.z_chunk):
+            z1 = min(z0 + self.z_chunk, self.nZ)
+            vol_geom, proj_geom = self._geoms(z1 - z0)
+            xc = np.ascontiguousarray(x[z0:z1], dtype=np.float32)
+            b_id, tmp_b = astra.create_sino3d_gpu(xc, proj_geom, vol_geom)
+            b[z0:z1] = tmp_b
+            astra.data3d.delete(b_id)
+        return np.transpose(b, (2, 1, 0))                              # (nX, nA, nZ)
+
+    def backward(self, sinogram):
+        """x = A^T b, streamed over z-chunks."""
+        b = sinogram
+        if self.proj_geo.zero_dose_sino is not None:
+            b[self.proj_geo.zero_dose_sino] = 0.0
+        tmp = np.transpose(b, (2, 1, 0))                               # (nZ, nA, nX)
+        x = np.empty((self.nZ, self.nY, self.nX), dtype=np.float32)
+        for z0 in range(0, self.nZ, self.z_chunk):
+            z1 = min(z0 + self.z_chunk, self.nZ)
+            vol_geom, proj_geom = self._geoms(z1 - z0)
+            tc = np.ascontiguousarray(tmp[z0:z1], dtype=np.float32)
+            x_id, xc = astra.creators.create_backprojection3d_gpu(tc, proj_geom, vol_geom)
+            x[z0:z1] = xc
+            astra.data3d.delete(x_id)
+        if self.proj_geo.absorption_coeff is not None:
+            x = self.proj_geo.absorption_mask * x
+        x = np.transpose(x)                                            # (nX, nY, nZ)
+        return vamtoolbox.util.data.clipToCircle(x)
+
+
 class Projector3DParallelCUDAAstra:
     def __init__(self, target_geo, proj_geo):
         self.target_geo = target_geo

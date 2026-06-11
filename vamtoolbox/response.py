@@ -9,6 +9,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _diffusion_convolve(vol, kernel):
+    """3D linear convolution for the diffusion blur.  fftconvolve (fast) for normal
+    volumes; overlap-add (oaconvolve) for very large volumes, where a full-volume
+    FFT would use ~15+ GB at 1024^3.  oaconvolve bounds memory to the block size."""
+    from scipy.signal import fftconvolve, oaconvolve
+    if vol.size > 400_000_000:   # ~735^3; e.g. 1024^3 -> overlap-add (bounded memory)
+        return oaconvolve(vol, kernel, mode="same")
+    return fftconvolve(vol, kernel, mode="same")
+
+
 class ResponseModel:
 
     _default_gen_log_fun = {"A": 0, "K": 1, "B": 25, "M": 0.5, "nu": 1}
@@ -55,9 +65,36 @@ class ResponseModel:
             parameter in linear (affine) function
             M is the y-intercept of the curve: map = M*f + C
 
+        diffusion_kernel : np.ndarray, optional
+            Optional 3D PSF for diffusion convolution (e.g. from blur_ker()).  When
+            provided, the analytical forward map convolves the dose with this kernel
+            before the non-linearity, and the derivative uses its adjoint (flipped
+            kernel) -- so a BCLP optimization pre-compensates for light diffusion in
+            the resin.  None (default) -> no diffusion, original behaviour.
         """
         self.type = type
         self.form = form
+
+        # Optional diffusion kernel (only used when provided, analytical mode).
+        self.diffusion_kernel = None
+        self._diffusion_kernel_adjoint = None
+        kernel = kwargs.pop("diffusion_kernel", None)
+        if kernel is not None:
+            k = np.asarray(kernel, dtype=np.float32)
+            if k.ndim != 3:
+                raise ValueError(
+                    f"diffusion_kernel must be a 3D array, got ndim={k.ndim}"
+                )
+            if np.allclose(k, 0):
+                warnings.warn(
+                    "diffusion_kernel is all zeros; diffusion will have no effect."
+                )
+            k_sum = float(k.sum())  # normalize to preserve total dose (sum=1)
+            if k_sum != 0.0:
+                k = k / k_sum
+            self.diffusion_kernel = k
+            # adjoint of convolution is convolution with the flipped kernel
+            self._diffusion_kernel_adjoint = np.flip(k)
 
         if self.type == "analytical":
             if self.form == "gen_log_fun":
@@ -191,14 +228,19 @@ class ResponseModel:
     def _map_glf(self, f: np.ndarray) -> np.ndarray:
         numerator = self.params["K"] - self.params["A"]
 
+        # Apply diffusion to the dose before the non-linearity (analytical only;
+        # interpolation builds its tables from the closed-form curve directly).
+        f_eff = self._apply_diffusion(f) if self.type == "analytical" else f
+
         self.cached_exp = np.exp(
-            -self.params["B"] * (f - self.params["M"])
+            -self.params["B"] * (f_eff - self.params["M"])
         )  # cache result for later computation of derivative
         denominator = (1 + self.cached_exp) ** (1 / self.params["nu"])
 
         self.cached_map = self.params["A"] + (
             numerator / denominator
         )  # cache result for later use
+        self._cached_f_eff = f_eff  # effective (diffused) dose, for the derivative
         return self.cached_map
 
     def _dmapdf_glf(self, f: np.ndarray, use_cached_result: bool = False) -> np.ndarray:
@@ -207,14 +249,31 @@ class ResponseModel:
 
         coef_1 = (1 / (self.params["K"] - self.params["A"])) ** self.params["nu"]
         coef_2 = self.params["B"] / self.params["nu"]
-        if use_cached_result:
-            coef_3 = (self.cached_map - self.params["A"]) ** (self.params["nu"] + 1)
-            exponential = self.cached_exp
-        else:
-            coef_3 = (self._map_glf(f) - self.params["A"]) ** (self.params["nu"] + 1)
-            exponential = np.exp(-self.params["B"] * (f - self.params["M"]))
 
-        self.cached_dmapdf = coef_1 * coef_2 * coef_3 * exponential
+        # With diffusion (analytical) the non-linearity acts on the diffused dose;
+        # the derivative w.r.t. the pre-diffusion dose needs the diffusion adjoint.
+        if self.type == "analytical":
+            if use_cached_result and hasattr(self, "_cached_f_eff"):
+                map_val = self.cached_map
+                exponential = self.cached_exp
+            else:
+                map_val = self._map_glf(f)  # caches exp, map, f_eff
+                exponential = self.cached_exp
+        else:
+            if use_cached_result:
+                map_val = self.cached_map
+                exponential = self.cached_exp
+            else:
+                map_val = self._map_glf(f)
+                exponential = np.exp(-self.params["B"] * (f - self.params["M"]))
+
+        coef_3 = (map_val - self.params["A"]) ** (self.params["nu"] + 1)
+        dmapdf_eff = coef_1 * coef_2 * coef_3 * exponential
+
+        if self.type == "analytical" and self.diffusion_kernel is not None:
+            self.cached_dmapdf = self._apply_diffusion_adjoint(dmapdf_eff)
+        else:
+            self.cached_dmapdf = dmapdf_eff
         return self.cached_dmapdf
 
     def _map_inv_glf(self, mapped: np.ndarray) -> np.ndarray:
@@ -231,11 +290,15 @@ class ResponseModel:
     # =================================Analytic: Linear (affine) function=====================================================
     # Definition of linear function: mapped = M*f + C
     def _map_lin(self, f: np.ndarray) -> np.ndarray:
-        self.cached_map = self.params["M"] * f + self.params["C"]
+        f_eff = self._apply_diffusion(f) if self.type == "analytical" else f
+        self.cached_map = self.params["M"] * f_eff + self.params["C"]
         return self.cached_map
 
     def _dmapdf_lin(self, f: np.ndarray, use_cached_result: bool = False) -> np.ndarray:
-        return np.ones_like(f) * self.params["M"]
+        dmapdf_eff = np.ones_like(f) * self.params["M"]
+        if self.type == "analytical" and self.diffusion_kernel is not None:
+            return self._apply_diffusion_adjoint(dmapdf_eff)
+        return dmapdf_eff
 
     def _map_inv_lin(self, mapped: np.ndarray) -> np.ndarray:
         return (mapped - self.params["C"]) / self.params["M"]
@@ -243,10 +306,22 @@ class ResponseModel:
     # =================================Analytic: Identity function============================================================
     # Definition of identity: mapped = f
     def _map_id(self, f: np.ndarray) -> np.ndarray:
-        self.cached_map = f
+        # With diffusion enabled (analytical), identity becomes "diffusion only".
+        f_eff = self._apply_diffusion(f) if self.type == "analytical" else f
+        self.cached_map = f_eff
         return self.cached_map
 
     def _dmapdf_id(self, f: np.ndarray, use_cached_result: bool = False) -> np.ndarray:
+        if self.type == "analytical" and self.diffusion_kernel is not None:
+            # d(identity-map)/d(dose) factor with diffusion is D^T(ones), which is
+            # constant (dose-independent) -> compute the adjoint convolution once
+            # and cache it (saves one FFT convolution per optimizer iteration).
+            if getattr(self, "_dmapdf_id_cache_key", None) != f.shape:
+                self._dmapdf_id_cache = self._apply_diffusion_adjoint(
+                    np.ones(f.shape, dtype=np.float32)
+                )
+                self._dmapdf_id_cache_key = f.shape
+            return self._dmapdf_id_cache
         return np.ones_like(f)
 
     def _map_inv_id(self, mapped: np.ndarray) -> np.ndarray:
@@ -289,6 +364,36 @@ class ResponseModel:
             left=self.interp_f_0[0],
             right=self.interp_f_0[-1],
         )  # Extrapolation points are taken as nearest neighbor, same as default
+
+    # =================================Diffusion=============================================================================
+    def _apply_diffusion(self, f: np.ndarray):
+        """Convolve the (3D) dose with the diffusion PSF.  No-op if no kernel.
+
+        Uses FFT-based convolution (scipy.signal.fftconvolve), which is ~50-100x
+        faster than direct ndimage.convolve for the ~19^3 PSF and numerically
+        identical (linear zero-padded convolution, central 'same' output).
+        """
+        if self.diffusion_kernel is None:
+            return f
+        f_arr = np.asarray(f)
+        original_shape = f_arr.shape
+        f_3d = np.atleast_3d(f_arr).astype(np.float32, copy=False)
+        diffused = _diffusion_convolve(f_3d, self.diffusion_kernel)
+        if original_shape == ():
+            return float(diffused.reshape(-1)[0])
+        return diffused.reshape(original_shape).astype(f_arr.dtype, copy=False)
+
+    def _apply_diffusion_adjoint(self, f: np.ndarray):
+        """Adjoint of the diffusion convolution (convolution with the flipped kernel)."""
+        if self._diffusion_kernel_adjoint is None:
+            return f
+        f_arr = np.asarray(f)
+        original_shape = f_arr.shape
+        f_3d = np.atleast_3d(f_arr).astype(np.float32, copy=False)
+        diffused_adj = _diffusion_convolve(f_3d, self._diffusion_kernel_adjoint)
+        if original_shape == ():
+            return float(diffused_adj.reshape(-1)[0])
+        return diffused_adj.reshape(original_shape).astype(f_arr.dtype, copy=False)
 
     # =================================Utilities==========================================================================
     def plotMap(
@@ -397,3 +502,69 @@ class ResponseModel:
 
     def __repr__(self):
         return str(self.params)
+
+
+def blur_ker(mm_in_px, D, tmax, rotspd, psf_size=19, fwhm_z=0.190, fwhm_xy=0.120):
+    """
+    Combined optical + diffusion point-spread function (PSF) for VAM diffusion
+    correction.  Pass the result as ``diffusion_kernel`` to ResponseModel.
+
+    Ported from the diffusion-correction build of VAMToolbox.  Models the optical
+    blur (anisotropic Gaussian) convolved with the resin diffusion kernel summed
+    over every vial rotation that occurs during the print.
+
+    Parameters
+    ----------
+    mm_in_px : float   voxel pitch (mm per voxel) of the OPTIMIZE grid.
+    D : float          resin diffusion coefficient (mm^2 / s).
+    tmax : float       total print time (s).
+    rotspd : float     vial rotation speed (deg / s).
+    psf_size : int     PSF cube side in voxels (odd; large enough not to clip).
+    fwhm_z, fwhm_xy : float
+                       optical-PSF FWHM (mm) along / perpendicular to the vial
+                       axis (measured values; defaults are the lab system's).
+
+    Returns
+    -------
+    np.ndarray   3D combined PSF, normalized to sum = 1.
+    """
+    from scipy.signal import convolve as _convolve  # signal.convolve has mode='same'
+
+    dt = 360.0 / rotspd  # seconds per full vial rotation
+    ntot = int(tmax // dt)
+    px = mm_in_px
+
+    n = int(psf_size)
+    x, y, z = np.mgrid[0:n, 0:n, 0:n]
+    x = x * px - np.mean(x * px)
+    y = y * px - np.mean(y * px)
+    z = z * px - np.mean(z * px)
+    r = np.sqrt(x**2 + y**2 + z**2)
+
+    # optical part of the PSF (anisotropic Gaussian)
+    sigm_z = fwhm_z / 2.355
+    sigm_xy = fwhm_xy / 2.355
+    dkeropt = np.exp(
+        -(x**2) / (2 * sigm_z**2)
+        - (y**2) / (2 * sigm_xy**2)
+        - (z**2) / (2 * sigm_xy**2)
+    )
+    dkeropt = dkeropt / np.sum(dkeropt)
+
+    # diffusion part: diffusion-equation Green's function, summed over each vial
+    # rotation that occurs during the print.
+    dker = (1 / ((4 * np.pi * D * (dt / 2)) ** 1.5)) * np.exp(
+        -(r**2) / (4 * D * (dt / 2))
+    ) * px**3
+    dker = dker / np.sum(dker)
+    for k in range(1, max(ntot, 1)):
+        t = dt * k
+        ddker = (1 / ((4 * np.pi * D * t) ** 1.5)) * np.exp(-(r**2) / (4 * D * t)) * px**3
+        ddker = ddker / np.sum(ddker)
+        dker = dker + ddker
+    dker = dker / np.sum(dker)
+
+    # combine optical and diffusion parts
+    dker2 = _convolve(dker, dkeropt, mode="same")
+    dker2 = dker2 / np.sum(dker2)
+    return dker2

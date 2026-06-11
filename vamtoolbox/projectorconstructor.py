@@ -46,10 +46,8 @@ def projectorconstructor(
     """
 
     # check arguments
-    # FIXME: What is this weirdness
-    assert isinstance(
-        target_geo, geometry.TargetGeometry
-    ), "target_geo should be of type: geometry.TargetGeometry"
+    assert hasattr(target_geo, "nX") and hasattr(target_geo, "n_dim"), \
+        "target_geo must have geometry attributes (nX, nY, nZ, n_dim)"
     assert isinstance(
         proj_geo, geometry.ProjectionGeometry
     ), "proj_geo should be of type: geometry.ProjectionGeometry"
@@ -58,6 +56,16 @@ def projectorconstructor(
     if isinstance(optical_params, CALopticalparams):
         # TODO: utilize optical_params in projector construction
         pass
+
+    # Mesh-based GPU ray-density projector (Taichi, backend-agnostic).
+    # Must be checked before the CUDA/CPU split because Taichi selects its
+    # own backend internally.
+    if proj_geo.ray_type == "ray_density":
+        from vamtoolbox.projector.ProjectorRayDensityGPU import ProjectorRayDensityGPU
+        A = ProjectorRayDensityGPU(target_geo, proj_geo)
+        if target_geo.zero_dose is not None:
+            proj_geo.calcZeroDoseSinogram(A, target_geo)
+        return A
 
     if target_geo.insert is not None:
         if proj_geo.attenuation_field is not None:
@@ -100,18 +108,36 @@ def projectorconstructor(
 
             else:
                 if target_geo.n_dim == 2:
-                    from vamtoolbox.projector.Projector2DParallelCUDA import (
-                        Projector2DParallelCUDAAstra,
-                    )
-
-                    A = Projector2DParallelCUDAAstra(target_geo, proj_geo)
+                    try:
+                        from vamtoolbox.projector.Projector2DParallelCUDA import (
+                            Projector2DParallelCUDAAstra,
+                        )
+                        A = Projector2DParallelCUDAAstra(target_geo, proj_geo)
+                    except (ImportError, AttributeError):
+                        from vamtoolbox.projector.Projector2DParallel import (
+                            Projector2DParallelSkimage,
+                        )
+                        A = Projector2DParallelSkimage(target_geo, proj_geo)
 
                 else:
-                    from vamtoolbox.projector.Projector3DParallelCUDA import (
-                        Projector3DParallelCUDAAstra,
-                    )
-
-                    A = Projector3DParallelCUDAAstra(target_geo, proj_geo)
+                    inclined = getattr(proj_geo, "inclination_angle", None) not in (None, 0)
+                    try:
+                        if inclined:
+                            from vamtoolbox.projector.Projector3DParallelCUDA import (
+                                Projector3DParallelCUDAAstra,
+                            )
+                            A = Projector3DParallelCUDAAstra(target_geo, proj_geo)
+                        else:
+                            # z-chunked GPU projector: bounds VRAM for tall/large volumes
+                            from vamtoolbox.projector.Projector3DParallelCUDA import (
+                                Projector3DParallelCUDAAstraChunked,
+                            )
+                            A = Projector3DParallelCUDAAstraChunked(target_geo, proj_geo)
+                    except (ImportError, AttributeError):
+                        from vamtoolbox.projector.Projector3DParallel import (
+                            Projector3DParallelSkimage,
+                        )
+                        A = Projector3DParallelSkimage(target_geo, proj_geo)
 
     # if CPU projection
     else:
@@ -143,21 +169,51 @@ def projectorconstructor(
 
             else:
                 if target_geo.n_dim == 2:
-                    from vamtoolbox.projector.Projector2DParallel import (
-                        Projector2DParallelAstra,
-                    )
-
-                    A = Projector2DParallelAstra(target_geo, proj_geo)
+                    try:
+                        from vamtoolbox.projector.Projector2DParallel import (
+                            Projector2DParallelAstra,
+                        )
+                        A = Projector2DParallelAstra(target_geo, proj_geo)
+                    except (ImportError, AttributeError):
+                        from vamtoolbox.projector.Projector2DParallel import (
+                            Projector2DParallelSkimage,
+                        )
+                        A = Projector2DParallelSkimage(target_geo, proj_geo)
 
                 else:
-                    from vamtoolbox.projector.Projector3DParallel import (
-                        Projector3DParallelAstra,
+                    # Default CPU 3D parallel projector: precomputed astra-built
+                    # sparse system matrix (~5x faster than skimage radon, and it
+                    # matches the astra-CUDA/GPU convention).  Falls back to skimage
+                    # for cases the sparse projector doesn't cover, or if it can't
+                    # be built.  Set proj_geo.sparse = False to force skimage.
+                    sparse_pref = getattr(proj_geo, "sparse", None)
+                    use_sparse = sparse_pref is not False and (
+                        proj_geo.ray_type == "parallel"
+                        and getattr(proj_geo, "inclination_angle", None) in (None, 0)
+                        and getattr(proj_geo, "attenuation_field", None) is None
                     )
-
-                    A = Projector3DParallelAstra(target_geo, proj_geo)
-
-                    # from vamtoolbox.projector.Projector3DParallel import Projector3DParallelPython
-                    # A = Projector3DParallelPython(target_geo,proj_geo)
+                    A = None
+                    if use_sparse:
+                        try:
+                            from vamtoolbox.projector.Projector3DParallel import (
+                                Projector3DParallelSparse,
+                            )
+                            A = Projector3DParallelSparse(target_geo, proj_geo)
+                        except Exception as e:  # astra missing / build failure
+                            print(f"  [projectorconstructor] sparse projector "
+                                  f"unavailable ({e}); falling back to skimage.")
+                            A = None
+                    if A is None:
+                        try:
+                            from vamtoolbox.projector.Projector3DParallel import (
+                                Projector3DParallelSkimage,
+                            )
+                            A = Projector3DParallelSkimage(target_geo, proj_geo)
+                        except (ImportError, AttributeError):
+                            from vamtoolbox.projector.Projector3DParallel import (
+                                Projector3DParallelAstra,
+                            )
+                            A = Projector3DParallelAstra(target_geo, proj_geo)
 
     if target_geo.zero_dose is not None:
         proj_geo.calcZeroDoseSinogram(A, target_geo)

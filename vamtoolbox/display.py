@@ -538,11 +538,13 @@ def showHistogramPlot(*args, **kwargs):
 
 
 class EvolvingPlot:
-    def __init__(self, target_geo, n_iter):
+    def __init__(self, target_geo, n_iter, save_img_path=None):
         plt.ion()
         self.target = target_geo.array
         self.n_dim = target_geo.n_dim
         self.n_iter = n_iter
+        self.save_img_path = save_img_path
+        self.frame_ind = 0
 
         self.fig, self.axs = plt.subplots(2, 2, figsize=(12, 10))
         self.target_plot = SlicePlot(
@@ -583,6 +585,9 @@ class EvolvingPlot:
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
+        if self.save_img_path is not None:
+            plt.savefig(self.save_img_path + f"\\{self.frame_ind}.png")
+            self.frame_ind += 1
 
     def ioff(self):
         plt.ioff()

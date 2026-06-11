@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 import numpy as np
 import pyglet
@@ -292,7 +293,9 @@ class OpenGLSlicer:
         self,
     ):
         """Begin the pyglet window which will render each slice"""
-        self.window = pyglet.window.Window()
+        # Hidden: slices render to an off-screen FBO, so the window is only a GL
+        # context holder — no need to flash a visible window during voxelization.
+        self.window = pyglet.window.Window(visible=False)
         self.window.set_vsync(False)
         self.window.set_mouse_visible(False)
         self.window.switch_to()
@@ -598,6 +601,99 @@ class OpenGLSlicer:
         glViewport(0, 0, self.width, self.height)
 
         return np.copy(data_numpy)
+
+
+def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0, 0]):
+    """
+    OpenGL-based replacement for voxelizeTarget.
+
+    Uses the layer-by-layer OpenGL slicer with the XY-centering / Z_min=0 fix.
+    Drop-in compatible with the old voxelizeTarget signature, including
+    multi-body support for overprinting (insert) and zero-dose constraints.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to .stl file.
+    resolution : int
+        Number of Z layers (layer_thickness = z_extent / resolution).
+    bodies : str or dict
+        'all' — voxelize every body as the print target.
+        dict  — keys 'print', 'insert', 'zero_dose' map to lists of
+                1-indexed connected-component indices (matching the order
+                trimesh returns from mesh.split()).
+                Example: {"print": [2], "insert": [1]}
+    rot_angles : list of float
+        Rotation angles in degrees around (x, y, z) axes.
+
+    Returns
+    -------
+    array_voxels    : np.ndarray uint8, shape (nY, nX, nZ)
+    insert_voxels   : np.ndarray uint8 or None
+    zero_dose_voxels: np.ndarray uint8 or None
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"STL file not found: {input_path}")
+
+    # Load and optionally rotate the full mesh
+    raw = trimesh.load(input_path, force="mesh")
+    if np.any(rot_angles):
+        raw = rotate_mesh(raw, rot_angles)
+
+    # Split into connected components (1-indexed to match caller convention)
+    components = raw.split(only_watertight=False)
+    if len(components) == 0:
+        components = [raw]
+
+    # Global Z-fix derived from ALL components so every output array shares
+    # the same coordinate frame and grid shape.
+    all_verts  = np.vstack([c.vertices for c in components])
+    xy_center  = (all_verts[:, :2].min(0) + all_verts[:, :2].max(0)) / 2
+    z_min      = all_verts[:, 2].min()
+    z_extent   = all_verts[:, 2].max() - z_min
+    lt         = z_extent / resolution
+
+    # Apply Z-fix to every component
+    fixed = []
+    for c in components:
+        fc = c.copy()
+        fc.vertices[:, :2] -= xy_center
+        fc.vertices[:, 2]  -= z_min
+        fixed.append(fc)
+
+    # Export the complete merged mesh to establish global bounds in the Voxelizer.
+    # Subsequent per-group voxelizations reuse these bounds so all arrays are
+    # the same shape.
+    full_merged = trimesh.util.concatenate(fixed)
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+        full_path = tmp.name
+    full_merged.export(full_path)
+    try:
+        v = Voxelizer()
+        v.addMeshes({full_path: "_global"})
+    finally:
+        os.unlink(full_path)
+
+    def _voxelize_group(indices):
+        """Merge the selected components and voxelize using the global bounds."""
+        if not indices:
+            return None
+        group = trimesh.util.concatenate([fixed[i - 1] for i in indices])
+        # Directly assign the BodyMesh so the already-established global bounds
+        # are preserved (addMeshes would recompute and potentially shrink them).
+        v.meshes["_group"] = BodyMesh(group)
+        return v.voxelize("_group", layer_thickness=lt, voxel_value=1, voxel_dtype="uint8")
+
+    if bodies == "all":
+        arr_print     = _voxelize_group(list(range(1, len(fixed) + 1)))
+        arr_insert    = None
+        arr_zero_dose = None
+    else:
+        arr_print     = _voxelize_group(bodies.get("print", []))
+        arr_insert    = _voxelize_group(bodies.get("insert", []))
+        arr_zero_dose = _voxelize_group(bodies.get("zero_dose", []))
+
+    return arr_print, arr_insert, arr_zero_dose
 
 
 def voxelizeTarget(

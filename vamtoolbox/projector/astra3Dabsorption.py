@@ -31,7 +31,7 @@ class astra3Dabsorption:
             self.print_time = 0
             self.rot_vel = 0
 
-        self.cuda_available = astra.astra.use_cuda()
+        self.cuda_available = astra.use_cuda()
 
         if self.cuda_available:
             # if gpu is available setup 3D projector
