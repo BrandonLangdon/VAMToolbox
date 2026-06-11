@@ -21,6 +21,8 @@
 
 VAMToolbox is a Python library to support the generation of the light projections and the control of a DLP projector for tomographic volumetric additive manufacturing. It provides visualization, various optimization techniques, and flexible projection geometries to assist in the creation of sinograms and reconstructions for simulated VAM.
 
+Prefer a graphical workflow? `Tomo <https://github.com/computed-axial-lithography/tomo>`_ is a standalone Windows desktop application that wraps VAMToolbox end-to-end (load STL → voxelize → optimize → preview/export) with no Python setup required. See the `Tomo desktop application`_ section below.
+
 VAMToolbox 2.0.0 Release Notes:
 ------------
 This major release includes a number of new features and improvements. The major changes are listed below. For more details, please refer to the documentation.
@@ -82,6 +84,38 @@ For more information, refer to the `installation documentation <https://vamtoolb
 Resources
 ---------
 View the `documentation <https://vamtoolbox.readthedocs.io/en/latest/_docs/intro.html>`_ site.
+
+
+Tomo desktop application
+------------------------
+`Tomo <https://github.com/computed-axial-lithography/tomo>`_ is a standalone Windows desktop GUI built on top of VAMToolbox. It exposes the full pipeline — load one or more STLs, voxelize on the GPU, optimize the projections (OSMO or BCLP), then preview and export a print-ready projection video — through a guided four-stage interface (Prep → Voxelize → Optimize → Preview), with live 3D previews, absorption/diffusion correction toggles, hardware auto-tuning, and a z-slab memory mode for very large parts.
+
+Tomo is a thin front end: all voxelization, optimization, and physics are performed by VAMToolbox via the high-level ``vamtoolbox.pipeline`` API (see below). It ships as a single NSIS installer with a self-contained Python/CUDA runtime bundled in, so end users do not need to set up Python, conda, or CUDA. It is released under the same UC Regents license as VAMToolbox.
+
+
+Changes in this branch (Tomo integration, 2026-06)
+--------------------------------------------------
+This branch adds the supporting library work behind the Tomo GUI and improvements for large-part, high-resolution prints. Changed/added modules (per the license's "mark your changes" requirement):
+
+1. High-level pipeline API (new ``vamtoolbox/pipeline.py``)
+
+   A clean, GUI-facing API — ``PrintConfig`` (a JSON-serializable dataclass of all job parameters, with ``.validate()``) and ``VAMPipeline`` (stateful: ``detect_hardware`` / ``voxelize`` / ``optimize`` / ``rebin`` / ``save_video`` / ``run``, with staged progress callbacks, ETA estimation, and cancellation). No environment variables or globals are required to drive a full job. Re-exported at the top level as ``vamtoolbox.PrintConfig`` / ``VAMPipeline`` / ``run_print``. Example: ``examples/gui_integration_example.py``.
+
+2. Optimization and large-volume performance
+
+   Per-iteration progress callbacks added to the OSMO and BCLP loops (for live GUI progress). Memory-scalable optimization for billion-voxel volumes via z-slab chunking in the 3D projectors (``Projector3DParallel`` / ``Projector3DParallelCUDA``), a new GPU ray-density projector (``projector/ProjectorRayDensityGPU.py``), and a low-memory BCLP variant (``optimizer/BCLP_lowmem.py``). On the CPU path, a sparse-matrix projector substantially reduces per-iteration cost.
+
+3. Resolution-aware physics corrections
+
+   Absorption (``geometry.py``) and diffusion (``response.py``) corrections now use the real physical voxel pitch rather than pixel units, so results are consistent across resolutions.
+
+4. Hardware detection (new ``vamtoolbox/util/hardware.py``)
+
+   CUDA capability detection and auto-tuning of run parameters, with a CPU fallback.
+
+5. Cleanup and packaging
+
+   ``torch`` is now an optional dependency — the imports in ``vamtoolbox/__init__.py`` and ``vamtoolbox/projector/__init__.py`` are guarded so the OSMO/BCLP + astra/sparse path runs without torch installed (enabling a much slimmer bundled runtime). Added Python 3.13 support (``requirements-py313.txt``), a ``pytest`` test suite under ``tests/``, and additional usage examples under ``examples/``.
 
 
 License
