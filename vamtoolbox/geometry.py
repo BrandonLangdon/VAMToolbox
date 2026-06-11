@@ -1,15 +1,44 @@
 import functools
 from logging import warning
-from typing import Literal
+from typing import Literal, TypeAlias
 
 import dill  # type: ignore
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from PIL import Image, ImageOps
 from scipy import interpolate, sparse
 
 import vamtoolbox
+
+try:
+    from joblib import Parallel as _Parallel, delayed as _jdelayed, effective_n_jobs as _eff_n_jobs
+except ImportError:
+    _Parallel = None
+
+# Worker count for the parallel fan-beam rebin.  -1 = all cores (fastest, but pegs
+# the whole CPU for ~tens of seconds on big sinograms); set to a positive int to cap
+# the spike, or 1 to force the serial path.  Override via env VAM_REBIN_JOBS or by
+# setting vamtoolbox.geometry.REBIN_N_JOBS at runtime.
+import os as _os
+REBIN_N_JOBS = int(_os.environ.get("VAM_REBIN_JOBS", "-1"))
+
+
+def _rebin_chunk(b_chunk, xp, angles, x_samp, theta_samp, dxv_dxp, T_inv):
+    """Worker for parallel rebinFanBeam: resample a contiguous block of z-slices.
+    b_chunk: (N_r, N_angles, k) -> (N_r, N_angles, k).  Each z-slice is independent.
+    """
+    out = np.empty_like(b_chunk)
+    for i in range(b_chunk.shape[2]):
+        rb = interpolate.interpn(
+            (xp, angles), b_chunk[:, :, i], (x_samp, theta_samp),
+            method="linear", bounds_error=False, fill_value=0,
+        )
+        out[:, :, i] = T_inv * (rb * dxv_dxp)
+    return out
 
 
 def defaultKwargs(**default_kwargs):
@@ -24,7 +53,7 @@ def defaultKwargs(**default_kwargs):
     return actualDecorator
 
 
-type RayType = Literal["parallel", "cone", "algebraic", "ray_trace"]
+RayType: TypeAlias = Literal["parallel", "cone", "algebraic", "ray_trace"]
 
 
 class ProjectionGeometry:
@@ -181,11 +210,27 @@ class ProjectionGeometry:
             np.linspace(-r, r, x.shape[0]), np.linspace(-r, r, x.shape[1])
         )
 
-        # this is not mathematically valid but it works sufficiently until a projector kernel with ray-based absorption can be written
-        z = R - np.sqrt(circle_x**2 + circle_y**2)
+        # Radial approximation: depth from vial wall = R - radial_distance_from_centre.
+        # Exact path length depends on projection angle; this symmetric average is
+        # sufficient and is applied consistently to forward and back-projection.
+        radial_dist = np.sqrt(circle_x**2 + circle_y**2)
+        z = R - radial_dist  # depth from wall (0 at wall, R at centre)
 
-        self.absorption_mask = np.exp(-self.absorption_coeff * z)
-        self.absorption_mask[z < R - r] = 0
+        # float32 keeps the projector forward/backward from upcasting the whole
+        # volume to float64 (halves RAM for large-volume OSMO).
+        self.absorption_mask = np.exp(-self.absorption_coeff * z).astype(np.float32)
+        self.absorption_mask[radial_dist > r] = 0  # zero outside reconstruction circle
+
+        # Print absorption profile so the user can verify the correction is gradual.
+        depths_cm = np.array([0.0, R * 0.25, R * 0.5, R * 0.75, R])
+        labels = ["wall", "R/4", "R/2", "3R/4", "centre"]
+        print(
+            f"  Absorption mask profile  (mu = {self.absorption_coeff:.4f} cm^-1, R = {R:.3f} cm)"
+        )
+        for d, lbl in zip(depths_cm, labels):
+            print(
+                f"    {lbl:8s} (z={d:.2f} cm) : {100 * np.exp(-self.absorption_coeff * d):.1f}% intensity"
+            )
 
         if x.ndim == 3:
             self.absorption_mask = np.broadcast_to(
@@ -528,7 +573,7 @@ class TargetGeometry(Volume):
         # stl file as target to voxelized
         elif stlfilename is not None:
             self.stlfilename = stlfilename
-            array, insert, zero_dose = vamtoolbox.voxelize.voxelizeTarget(
+            array, insert, zero_dose = vamtoolbox.voxelize.voxelizeTargetOpenGL(
                 stlfilename, resolution, bodies, rot_angles
             )
             self.zero_dose = zero_dose
@@ -733,6 +778,214 @@ def getInds(target: np.ndarray):
     return gel_inds, void_inds
 
 
+def compute_rebin_params(
+    vial_id_mm,
+    vial_print_height_mm,
+    mm_per_pix,
+    proj_u_px,
+    proj_v_px,
+    throw_ratio=1.0,
+):
+    """
+    Compute rebinFanBeam parameters and print a geometry summary for a given vial
+    and optical setup.  Call once at script start to understand your achievable print volume.
+
+    Parameters
+    ----------
+    vial_id_mm : float
+        Vial inner diameter (mm).
+    vial_print_height_mm : float
+        Usable print height inside the vial (mm).  Subtract base glass thickness and
+        meniscus clearance from the nominal vial height before passing here.
+    mm_per_pix : float
+        Physical size of one projector pixel at the vial plane (mm/px).
+        Calibrate by projecting a ruler or known feature onto the vial plane.
+    proj_u_px : int
+        Projector pixel count in the U (vial-diameter) direction.
+    proj_v_px : int
+        Projector pixel count in the V (vial-height) direction.
+    throw_ratio : float
+        Projector throw ratio (throw distance / projected image width).
+
+    Returns
+    -------
+    dict with keys
+        vial_width_px  - pass directly as ``vial_width`` to rebinFanBeam
+        N_screen       - pass directly as ``N_screen`` to rebinFanBeam
+        size_scale     - pass as ``size_scale`` to ImageConfig so the rebinned
+                         sinogram fills the projector U axis exactly
+        max_diam_mm    - maximum printable part diameter (mm)
+        max_height_mm  - maximum printable part height (mm)
+        resolution     - recommended Z resolution (slices that span max_height_mm)
+        mm_per_pix_for_full_vial - mm_per_pix required so the full vial inner
+                         diameter fills the projector U axis (optical adjustment target)
+    """
+    fov_u_mm = proj_u_px * mm_per_pix
+    fov_v_mm = proj_v_px * mm_per_pix
+    vial_u_px = vial_id_mm / mm_per_pix
+
+    max_diam_mm = min(vial_id_mm, fov_u_mm)
+    max_height_mm = min(vial_print_height_mm, fov_v_mm)
+    resolution = int(round(max_height_mm / mm_per_pix))
+
+    # size_scale maps the vial_width_px sinogram onto the projector U axis.
+    # < 1 when the vial is wider than the FOV (shrink to fit the canvas).
+    # > 1 when the vial is narrower than the FOV (zoom in to fill).
+    # = 1 when the vial inner diameter exactly fills the projector U axis (optimal).
+    vial_width_px = int(round(vial_u_px))
+    if vial_width_px % 2 != 0:
+        vial_width_px += 1  # keep even so rebinFanBeam padding is always symmetric
+    size_scale = proj_u_px / max(vial_u_px, 1.0)
+
+    mm_per_pix_for_full_vial = vial_id_mm / proj_u_px
+
+    sep = "=" * 65
+    print(sep)
+    print("  VAM vial geometry analysis")
+    print(sep)
+    print(f"  Optical setup")
+    print(f"    mm per pixel (calibrated) : {mm_per_pix:.5f} mm/px")
+    print(f"    Projector U (diam axis)   : {proj_u_px} px  = {fov_u_mm:.1f} mm")
+    print(f"    Projector V (height axis) : {proj_v_px} px  = {fov_v_mm:.1f} mm")
+    print(f"  Vial")
+    print(f"    Inner diameter (ID)       : {vial_id_mm:.2f} mm  = {vial_u_px:.0f} px")
+    print(f"    Usable print height       : {vial_print_height_mm:.2f} mm")
+    print(f"  Maximum printable part")
+    print(
+        f"    Diameter                  : {max_diam_mm:.2f} mm  ({int(round(max_diam_mm / mm_per_pix))} px)"
+    )
+    print(f"    Height                    : {max_height_mm:.2f} mm  ({resolution} px)")
+    print(f"  rebinFanBeam parameters")
+    print(f"    vial_width                : {vial_width_px} px")
+    print(f"    size_scale for ImageConfig: {size_scale:.4f}")
+    if abs(size_scale - 1.0) > 0.01:
+        if vial_u_px > proj_u_px:
+            print(f"")
+            print(f"  *** OPTICS NOTE ***")
+            print(
+                f"  Vial ID ({vial_id_mm:.1f} mm) exceeds the projector FOV ({fov_u_mm:.1f} mm)."
+            )
+            print(
+                f"  The printed part diameter is limited to {max_diam_mm:.1f} mm by the optics."
+            )
+            print(f"  To maximize part size and set size_scale = 1.0, adjust the optics so")
+            print(
+                f"  the vial ID spans the full {proj_u_px} px (set mm_per_pix = "
+                f"{mm_per_pix_for_full_vial:.5f} mm/px)."
+            )
+        else:
+            print(f"")
+            print(f"  NOTE: Vial ID ({vial_id_mm:.1f} mm) is smaller than the projector FOV")
+            print(
+                f"  ({fov_u_mm:.1f} mm).  size_scale > 1 zooms in to fill the projector width."
+            )
+    print(sep)
+
+    return {
+        "vial_width_px": vial_width_px,
+        "N_screen": (proj_u_px, proj_v_px),
+        "size_scale": size_scale,
+        "max_diam_mm": max_diam_mm,
+        "max_height_mm": max_height_mm,
+        "resolution": resolution,
+        "mm_per_pix_for_full_vial": mm_per_pix_for_full_vial,
+    }
+
+
+def compute_fanbeam_extent(N_r, vial_width, N_screen, n_write, throw_ratio):
+    """
+    Determine how far outward the fan-beam rebinning stretches a sinogram of
+    width N_r pixels when projected through a cylindrical vial.
+
+    Because n_write > 1, each projector pixel at position xp illuminates a point
+    *closer to centre* inside the vial (xv < xp).  To reach the edge of the part
+    (at +/-N_r/2 in sinogram space) the projector must use pixels further out than
+    +/-N_r/2.  This function finds that outermost projector pixel (xp_edge) and
+    reports whether it falls within the vial_width frame.
+
+    If xp_edge > vial_width/2 the outer edges of the part cannot be illuminated by
+    any projector pixel in the vial frame - they will be silently zero in the
+    rebinned sinogram.
+
+    Parameters
+    ----------
+    N_r         : int   radial width of the original (pre-rebin) sinogram in pixels
+    vial_width  : int   vial inner diameter in projector pixels (= rebinFanBeam vial_width)
+    N_screen    : tuple (N_U, N_V) projector pixel count passed to rebinFanBeam
+    n_write     : float refractive index of the resin at the writing wavelength
+    throw_ratio : float projector throw ratio
+
+    Returns
+    -------
+    dict
+        xp_edge_px       - projector pixel (from centre) where the part boundary maps to
+        vial_half_px     - vial half-width (= vial_width/2); the available frame limit
+        stretch_factor   - xp_edge / (N_r/2); > 1 means the image is stretched outward
+        frame_fill_frac  - xp_edge / vial_half; > 1 means part edges exceed the frame
+        fits_in_frame    - True when the entire part can be projected without clipping
+        clipped_frac     - fraction of the half-width that is outside the frame (0 if fits)
+    """
+    N_U = N_screen[0]
+    n1 = 1.0
+    n2 = float(n_write)
+
+    throw_ratio_pix = throw_ratio * N_U
+    vial_half = vial_width / 2.0
+    part_half = N_r / 2.0
+
+    xp = np.linspace(-vial_half, vial_half, int(vial_width))
+    phi = np.arctan(xp / throw_ratio_pix)
+
+    # Position where a ray from pixel xp hits the vial wall
+    discriminant = 1.0 - (1.0 + (xp / throw_ratio_pix) ** 2) * (
+        1.0 - (vial_half / throw_ratio_pix) ** 2
+    )
+    discriminant = np.maximum(discriminant, 0.0)  # guard sqrt of negative
+    Rv = vial_half * np.sqrt(1.0 + (vial_half / throw_ratio_pix) ** 2)
+    xps = (xp - xp * np.sqrt(discriminant)) / (1.0 + (xp / throw_ratio_pix) ** 2)
+
+    theta10 = np.arcsin(np.clip(xps / Rv, -1.0, 1.0))
+    thetai = theta10 + phi
+    sin_t = np.clip((n1 / n2) * np.sin(thetai), -1.0, 1.0)
+    thetat = np.arcsin(sin_t)
+    thetav = theta10 - thetat
+
+    xv = xps * np.cos(thetav) - np.sin(thetav) * np.sqrt(
+        np.maximum(Rv**2 - xps**2, 0.0)
+    )
+
+    # Use only the positive half (symmetric problem)
+    mask = xp >= 0
+    xp_pos = xp[mask]
+    xv_pos = xv[mask]
+
+    # xv is the virtual (parallel-ray) coordinate illuminated by physical pixel xp.
+    # Find the physical pixel whose virtual coordinate equals the part boundary.
+    max_reachable_xv = np.max(xv_pos)
+
+    if part_half <= 0:
+        xp_edge = 0.0
+    elif part_half > max_reachable_xv:
+        # Even the outermost pixel can't reach the part edge - it's already clipped
+        xp_edge = vial_half * (part_half / max_reachable_xv)  # extrapolated
+    else:
+        xp_edge = float(np.interp(part_half, xv_pos, xp_pos))
+
+    stretch_factor = xp_edge / max(part_half, 1e-9)
+    frame_fill_frac = xp_edge / max(vial_half, 1e-9)
+    fits = frame_fill_frac <= 1.0
+    clipped_frac = max(0.0, frame_fill_frac - 1.0)
+
+    return {
+        "xp_edge_px": xp_edge,
+        "vial_half_px": vial_half,
+        "stretch_factor": stretch_factor,
+        "frame_fill_frac": frame_fill_frac,
+        "fits_in_frame": fits,
+        "clipped_frac": clipped_frac,
+    }
+
+
 def rebinFanBeam(sinogram, vial_width, N_screen, n_write, throw_ratio):
     """
     Rebins a parallel ray projection geometry (telecentric) to a converging fan beam projection geometry that can be used when the photopolymer vial is NOT indexed matched to its surrounding, i.e. when the projector light is directly incident on the outer wall of the vial at an air-vial interface.
@@ -815,7 +1068,10 @@ def rebinFanBeam(sinogram, vial_width, N_screen, n_write, throw_ratio):
         )  # Correcting for change in differential area in radon space.  Very small correction, could probably be ignored in most cases.
 
         if T is not None:
-            T_inv = 1 / T
+            # Guard against T=0 at grazing-incidence edge pixels (theta_i -> 90 deg).
+            # 1/max(T, 1e-10) prevents division-by-zero/NaN; the T-threshold mask
+            # applied after the loop removes the over-amplified edge rows.
+            T_inv = np.where(T > 0, 1.0 / np.maximum(T, 1e-10), 0.0)
             # Correction for Fresnel transmission loss
             b_rebinned = T_inv * b_rebinned
 
@@ -900,6 +1156,33 @@ def rebinFanBeam(sinogram, vial_width, N_screen, n_write, throw_ratio):
     )
     dxv_dxp_tiled = np.transpose(np.tile(dxv_dxp, (N_angles, 1)))
 
+    # Correctable-region diagnostic --------------------------------------------
+    # xv peaks at the correctable boundary; beyond it dxv_dxp <= 0 and those
+    # physical pixels contribute nothing.  If N_r/2 > max(xv), the outermost
+    # sinogram pixels are unreachable at the widest projection angles.
+    xv_max = float(np.max(xv))
+    vial_half = vial_width / 2.0
+    actual_frac = xv_max / vial_half
+    sinogram_half = N_r / 2.0
+    margin_px = xv_max - sinogram_half
+    tr_str = "inf (collimated)" if np.isinf(throw_ratio) else f"{throw_ratio:.2f}"
+    print(f"  rebinFanBeam correctable region  (n={n_write:.3f}, throw={tr_str})")
+    print(
+        f"    max reachable xv    : {xv_max:7.2f} px  ({actual_frac:.4f} x vial half-width)"
+    )
+    print(f"    sinogram half-width : {sinogram_half:7.1f} px  (N_r/2)")
+    print(f"    margin              : {margin_px:+7.2f} px")
+    if margin_px < 0:
+        print(
+            f"    *** CUT-OFF: outer {abs(margin_px):.1f} px of sinogram are unreachable - "
+            f"edge features will be missing at widest projection angles ***"
+        )
+    elif margin_px < 5:
+        print(
+            f"    WARNING: margin is very tight ({margin_px:.1f} px) - slight edge cut-off likely."
+        )
+    # end diagnostic -----------------------------------------------------------
+
     # Constructing the arrays (theta_samp = thetav) that contains the angles and ray coordinates (x_samp) at which the build volume is sampled by the projector.
     (
         theta_samp,
@@ -910,35 +1193,73 @@ def rebinFanBeam(sinogram, vial_width, N_screen, n_write, throw_ratio):
         theta_samp + thetaDelt
     )  # Remember, each ray in the vial is rotated by thetaDelt with respect to the optical axis
 
-    # This part deals with angles wrapping around past 360 degrees
+    # Wrap theta_samp back into [0, 360) then clamp to [min_theta, max_theta].
+    # The original code clamped anything > max_theta-diff_theta to min_theta, which
+    # incorrectly forced valid angles like 359 deg to 0 deg whenever thetavD pushed a
+    # near-edge pixel's angle above 358 deg.  That made edge pixels use the wrong
+    # projection angle, producing a ghost line on the opposite side of the frame
+    # as the rotation approached the 0/360 deg seam.
     min_theta, max_theta = sinogram.proj_geo.angles[0], sinogram.proj_geo.angles[-1]
-    diff_theta = abs(sinogram.proj_geo.angles[1] - sinogram.proj_geo.angles[0])
-    theta_samp[theta_samp > max_theta] = theta_samp[theta_samp > max_theta] - 360
-    theta_samp[theta_samp < min_theta] = 360 + theta_samp[theta_samp < min_theta]
-    theta_samp[theta_samp > max_theta - diff_theta] = min_theta
-    theta_samp[(theta_samp <= max_theta - diff_theta) & (theta_samp > max_theta)] = (
-        max_theta
-    )
+    theta_samp[theta_samp > 360] = theta_samp[theta_samp > 360] - 360
+    theta_samp[theta_samp < 0] = theta_samp[theta_samp < 0] + 360
+    theta_samp = np.clip(theta_samp, min_theta, max_theta)
 
-    # Padding the frames array so that its width is the same as the vial
-    pd = int((vial_width - N_r) / 2)
-    if pd > 0:
-        sinogram.array = np.pad(
-            sinogram.array, ((pd, pd), (0, 0), (0, 0)), mode="constant"
-        )
-    if np.shape(sinogram.array)[0] < vial_width:
+    # Pad sinogram radial axis to vial_width, keeping content centered.
+    # If N_r is odd, add one zero-column first so both N_r and vial_width are even
+    # and the centering pad is always exactly symmetric.
+    if N_r % 2 != 0:
         sinogram.array = np.pad(
             sinogram.array, ((0, 1), (0, 0), (0, 0)), mode="constant"
+        )
+        N_r += 1
+    total_pad = vial_width - N_r
+    if total_pad > 0:
+        pad_left = total_pad // 2
+        pad_right = total_pad - pad_left
+        sinogram.array = np.pad(
+            sinogram.array, ((pad_left, pad_right), (0, 0), (0, 0)), mode="constant"
         )
 
     sinogram_rs = np.zeros_like(
         sinogram.array
     )  # Initializing array that will contain the resampled projections
 
-    # Calculating the resampled projections for each slice of the object (frames) in a loop.
-    for z_i in range(N_z):
-        sinogram_rs[..., z_i] = rebin(
-            sinogram.array[..., z_i], xp, angles, x_samp, theta_samp, dxv_dxp_tiled, T_b
+    # Precompute T_inv once (the old inner rebin() recomputed it for every z-slice).
+    T_inv = np.where(T_b > 0, 1.0 / np.maximum(T_b, 1e-10), 0.0)
+
+    # Resample each z-slice (frame).  The slices are independent, so dispatch
+    # contiguous z-blocks across CPU workers when joblib is available.  Only worth
+    # it for large sinograms: below ~384 slices the one-time loky worker-spawn
+    # (paid here on GPU runs, where the pool isn't already warm) outweighs the gain.
+    if _Parallel is not None and N_z >= 384 and REBIN_N_JOBS != 1:
+        n_chunks = int(min(N_z, max(1, _eff_n_jobs(REBIN_N_JOBS)) * 2))
+        bounds = [b for b in np.array_split(np.arange(N_z), n_chunks) if len(b) > 0]
+        blocks = _Parallel(n_jobs=REBIN_N_JOBS)(
+            _jdelayed(_rebin_chunk)(
+                sinogram.array[:, :, zs[0]:zs[-1] + 1],
+                xp, angles, x_samp, theta_samp, dxv_dxp_tiled, T_inv,
+            )
+            for zs in bounds
         )
+        i0 = 0
+        for blk in blocks:
+            sinogram_rs[:, :, i0:i0 + blk.shape[2]] = blk
+            i0 += blk.shape[2]
+    else:
+        for z_i in range(N_z):
+            sinogram_rs[..., z_i] = _rebin_chunk(
+                sinogram.array[:, :, z_i:z_i + 1],
+                xp, angles, x_samp, theta_samp, dxv_dxp_tiled, T_inv,
+            )[..., 0]
+
+    # Zero out near-tangent edge pixels where Fresnel T -> 0 (T_inv -> inf).
+    # For telecentric projection dxv_dxp > 0 everywhere, so the dxv_dxp > 0 mask
+    # is vacuous - it doesn't remove any rows.  The actual problem is T_inv >= 5x
+    # at the last 1-2 rows on each side (xp ~ +/-vial_half, grazing incidence).
+    # Threshold on T directly: any row with T < 0.2 has T_inv > 5x amplification
+    # and will produce visible bright-line artifacts at the output frame edges.
+    T_EDGE_THRESHOLD = 0.2
+    correctable = T >= T_EDGE_THRESHOLD
+    sinogram_rs[~correctable, :, :] = 0
 
     return Sinogram(sinogram_rs, sinogram.proj_geo)

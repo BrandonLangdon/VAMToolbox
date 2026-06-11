@@ -172,7 +172,13 @@ class BCLPNorm:
         # Renamed variables has a separate copy
         self.response_model = options.response_model
         self.eps = options.eps
-        self.weight = options.weight
+        # float32 weight keeps the loss/gradient operands float32 even with a bool
+        # indicator `v` (bool * float32 -> float32), avoiding a float64 upcast.
+        self.weight = (
+            np.float32(options.weight)
+            if np.isscalar(options.weight)
+            else np.asarray(options.weight, dtype=np.float32)
+        )
         self.p = options.p
         self.q = options.q
         self.learning_rate = options.learning_rate
@@ -269,6 +275,9 @@ class BCLPNorm:
 
         self.g0_shape = self.g0.shape
         self.g0 = self.imposeSinogramConstraints(self.g0)
+        # Keep the sinogram float32 throughout (halves bandwidth on the g update/
+        # clip/reshape and avoids a float64->float32 copy in the projector).
+        self.g0 = np.asarray(self.g0, dtype=np.float32)
 
         # #Evaluate performance of initialization --> Turns out it should not be run here. It will be executed in the first iteration anyway.
         # self.updateVariables(self.g0) #update loss and gradient.
@@ -308,6 +317,9 @@ class BCLPNorm:
             self.mapped_dose_error_from_band_iter = self.logs.curr_iter
 
         if self.v_iter != self.logs.curr_iter:
+            # bool keeps this indicator small (1 byte/voxel vs 4); the operand stays
+            # float32 because self.weight is float32 (bool * float32 -> float32), so
+            # there is no float64 upcast and no float64->float32 copy in the projector.
             self.v = self.mapped_dose_error_from_band > 0
             self.v_iter = self.logs.curr_iter
 
@@ -492,6 +504,10 @@ class BCLPNorm:
                 self.checkConvergence() if self.exit_param is not None else False
             )  # This is where the loss function and gradient is evaluated, but the other auxilliary norms are not evaluated yet.
             self.callback(g_iter)  # self.logs.curr_iter is updated here
+            # Optional progress hook for GUIs / external callers (no-op if unset).
+            if getattr(self.logs.options, "iter_callback", None) is not None:
+                self.logs.options.iter_callback(
+                    iter + 1, self.logs.options.n_iter, float(self.loss))
             if is_converged:
                 self.logger.warning(
                     "Optimization converged or loss value reached zero."
@@ -537,7 +553,7 @@ class BCLPNorm:
         # This function check the shape of sinogram array and reshape it if needed.
         if desired_shape == "flattened":
             if len(g.shape) > 1:
-                g = np.reshape(g, np.product(g.shape))
+                g = np.reshape(g, np.prod(g.shape))
 
         elif desired_shape == "cylindrical":
             if len(g.shape) == 1:

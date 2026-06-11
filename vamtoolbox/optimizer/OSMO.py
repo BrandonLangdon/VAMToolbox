@@ -115,8 +115,12 @@ def minimizeOSMO(target_geo, proj_geo, options):
 
     min_proj_val = options.inhibition
 
+    dp = None
     if options.verbose == "plot":
-        dp = vamtoolbox.display.EvolvingPlot(target_geo, options.n_iter)
+        try:
+            dp = vamtoolbox.display.EvolvingPlot(target_geo, options.n_iter, getattr(options, "save_img_path", None))
+        except Exception as _e:
+            print("[OSMO] verbose plot unavailable:", _e); dp = None
 
     # the first model is just the target
     x_model = np.copy(target_geo.array)
@@ -149,12 +153,16 @@ def minimizeOSMO(target_geo, proj_geo, options):
         _error[curr_iter] = vamtoolbox.metrics.calcVER(target_geo, x)
 
         iter_times[curr_iter] = time.perf_counter() - t0
+        # Optional progress hook for GUIs / external callers (no-op if unset).
+        if getattr(options, "iter_callback", None) is not None:
+            options.iter_callback(curr_iter + 1, options.n_iter, float(_error[curr_iter]))
         if options.verbose == "time" or options.verbose == "plot":
             print(
                 "Iteration %4.0f at time: %6.1f s" % (curr_iter, iter_times[curr_iter])
             )
-        if options.verbose == "plot":
-            dp.update(_error, x)
+        if options.verbose == "plot" and dp is not None:
+            try: dp.update(_error, x)
+            except Exception as _e: print("[OSMO] verbose plot update failed:", _e); dp = None
 
         if options.exit_param is not None:
             if _error[curr_iter] <= options.exit_param:
@@ -168,7 +176,7 @@ def minimizeOSMO(target_geo, proj_geo, options):
 
     if options.verbose == "time" or options.verbose == "plot":
         print("Iteration %4.0f at time: %6.1f s" % (curr_iter, iter_times[curr_iter]))
-    if options.verbose == "plot":
+    if options.verbose == "plot" and dp is not None:
         dp.ioff()
     # plt.close()
     return (

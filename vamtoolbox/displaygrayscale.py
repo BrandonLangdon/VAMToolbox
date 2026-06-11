@@ -747,7 +747,7 @@ class EvolvingPlot:
             title=r"Other $L_{p}$ norms with original tolerance $\varepsilon$",
             xlabel="Iteration",
             ylabel="Normalized norm value",
-            legends=["$L_{0}$", "$L_{1}$", "$L_{2}$", "$L_{\infty}$"],
+            legends=["$L_{0}$", "$L_{1}$", "$L_{2}$", "$L_{\\infty}$"],
             normalization_flags=(True, True, True, True),
         )
 
@@ -761,7 +761,7 @@ class EvolvingPlot:
             title=r"Other $L_{p}$ norms with zero tolerance $\varepsilon = 0$",
             xlabel="Iteration",
             ylabel="Normalized norm value",
-            legends=["$L_{0}$", "$L_{1}$", "$L_{2}$", "$L_{\infty}$"],
+            legends=["$L_{0}$", "$L_{1}$", "$L_{2}$", "$L_{\\infty}$"],
             normalization_flags=(True, True, True, True),
         )
 
@@ -785,7 +785,7 @@ class EvolvingPlot:
         plt.show()
         plt.pause(0.01)
         if self.save_img_path is not None:
-            matplotlib.pyplot.savefig(self.save_img_path + f"\{self.frame_ind}.png")
+            matplotlib.pyplot.savefig(self.save_img_path + f"\\{self.frame_ind}.png")
             self.frame_ind += 1
 
     def update(self, loss, dose=None, mapped=None, norms_list=None):
@@ -806,7 +806,7 @@ class EvolvingPlot:
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         if self.save_img_path is not None:
-            matplotlib.pyplot.savefig(self.save_img_path + f"\{self.frame_ind}.png")
+            matplotlib.pyplot.savefig(self.save_img_path + f"\\{self.frame_ind}.png")
             self.frame_ind += 1
 
     def ioff(self):
@@ -897,7 +897,7 @@ class EvolvingPlotDemo:
         plt.show()
         plt.pause(0.01)
         if self.save_img_path is not None:
-            matplotlib.pyplot.savefig(self.save_img_path + f"\{self.frame_ind}.png")
+            matplotlib.pyplot.savefig(self.save_img_path + f"\\{self.frame_ind}.png")
             self.frame_ind += 1
 
     def update(
@@ -916,7 +916,7 @@ class EvolvingPlotDemo:
         self.fig.canvas.flush_events()
 
         if self.save_img_path is not None:
-            matplotlib.pyplot.savefig(self.save_img_path + f"\{self.frame_ind}.png")
+            matplotlib.pyplot.savefig(self.save_img_path + f"\\{self.frame_ind}.png")
             self.frame_ind += 1
 
     def ioff(self):
@@ -1005,10 +1005,10 @@ def errorTolerancePlot(x, target_geo, dh, tol, savepath=None):
     cmap_under = matplotlib.colors.ListedColormap(["black", "bisque"])
     cmap_over = matplotlib.colors.ListedColormap(["black", "paleturquoise"])
 
-    th_over = np.array(x >= dh - tol, dtype=np.bool)
+    th_over = np.array(x >= dh - tol, dtype=bool)
     th_over = np.array(np.logical_and(th_over, void), dtype=int)
 
-    th_under = np.array(x <= dh + tol, dtype=np.bool)
+    th_under = np.array(x <= dh + tol, dtype=bool)
     th_under = np.array(np.logical_and(th_under, gel), dtype=int)
 
     fig, axs = plt.subplots(1, 3, figsize=(15, 12))
