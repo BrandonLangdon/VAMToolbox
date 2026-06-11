@@ -21,4 +21,4 @@ from . import displaygrayscale
 from . import pipeline
 from .pipeline import PrintConfig, VAMPipeline, PrintResult, run_print
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
