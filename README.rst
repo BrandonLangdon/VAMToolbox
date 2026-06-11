@@ -23,6 +23,39 @@ VAMToolbox is a Python library to support the generation of the light projection
 
 Prefer a graphical workflow? `Tomo <https://github.com/computed-axial-lithography/tomo>`_ is a standalone Windows desktop application that wraps VAMToolbox end-to-end (load STL → voxelize → optimize → preview/export) with no Python setup required. See the `Tomo desktop application`_ section below.
 
+VAMToolbox 3.0.0 Release Notes:
+-------------------------------
+This release adds a high-level pipeline API, a desktop GUI (Tomo), large-part/high-resolution performance work, resolution-aware physics, and a simplified ASTRA-based install. Changed/added modules are listed (per the license's "mark your changes" requirement; changes made 2026-06).
+
+1. Tomo desktop application
+
+   `Tomo <https://github.com/computed-axial-lithography/tomo>`_, a standalone Windows GUI built on VAMToolbox, is now available. See the `Tomo desktop application`_ section below.
+
+2. High-level pipeline API (new ``vamtoolbox/pipeline.py``)
+
+   A clean, GUI-facing API — ``PrintConfig`` (a JSON-serializable dataclass of all job parameters, with ``.validate()``) and ``VAMPipeline`` (stateful: ``detect_hardware`` / ``voxelize`` / ``optimize`` / ``rebin`` / ``save_video`` / ``run``, with staged progress callbacks, ETA estimation, and cancellation). No environment variables or globals are required to drive a full job. Re-exported at the top level as ``vamtoolbox.PrintConfig`` / ``VAMPipeline`` / ``run_print``. Example: ``examples/gui_integration_example.py``.
+
+3. Optimization and large-volume performance
+
+   Per-iteration progress callbacks added to the OSMO and BCLP loops (for live GUI progress). Memory-scalable optimization for billion-voxel volumes via z-slab chunking in the 3D projectors (``Projector3DParallel`` / ``Projector3DParallelCUDA``), a new GPU ray-density projector (``projector/ProjectorRayDensityGPU.py``), and a low-memory BCLP variant (``optimizer/BCLP_lowmem.py``). On the CPU path, a sparse-matrix projector substantially reduces per-iteration cost.
+
+4. Resolution-aware physics corrections
+
+   Absorption (``geometry.py``) and diffusion (``response.py``) corrections now use the real physical voxel pitch rather than pixel units, so results are consistent across resolutions.
+
+5. Hardware detection (new ``vamtoolbox/util/hardware.py``)
+
+   CUDA capability detection and auto-tuning of run parameters, with a CPU fallback.
+
+6. ASTRA backend and standalone install
+
+   VAMToolbox uses the `ASTRA Toolbox <https://astra-toolbox.com>`_ as its CUDA tomography backend for the projection/reconstruction operators. ASTRA no longer has to come from conda — it can be installed as a standalone, CUDA-bundled wheel downloaded directly from the `ASTRA Toolbox site <https://astra-toolbox.com/docs/install.html>`_ (or its `GitHub releases <https://github.com/astra-toolbox/astra-toolbox/releases>`_). This enables a plain ``pip``/venv setup on **Python 3.13** (see ``requirements-py313.txt``) without a conda environment, and is how the bundled Tomo runtime ships ASTRA. See `Installation`_.
+
+7. Cleanup and packaging
+
+   ``torch`` is now an optional dependency — the imports in ``vamtoolbox/__init__.py`` and ``vamtoolbox/projector/__init__.py`` are guarded so the OSMO/BCLP + ASTRA/sparse path runs without torch installed (enabling a much slimmer bundled runtime). Added Python 3.13 support (``requirements-py313.txt``), a ``pytest`` test suite under ``tests/``, and additional usage examples under ``examples/``.
+
+
 VAMToolbox 2.0.0 Release Notes:
 ------------
 This major release includes a number of new features and improvements. The major changes are listed below. For more details, please refer to the documentation.
@@ -78,6 +111,17 @@ To install VAMToolbox, enter the command below in the `Anaconda <https://www.ana
 
 *NOTE: This toolbox is currently only compatible with Windows OS.*
 
+**Standalone (pip / venv, Python 3.13) — without conda**
+
+As of 3.0.0 you can run VAMToolbox in a plain virtual environment. The only dependency that is not on PyPI for Windows is ASTRA, which is installed from a standalone, CUDA-bundled wheel downloaded directly from the `ASTRA Toolbox site <https://astra-toolbox.com/docs/install.html>`_ (or its `GitHub releases <https://github.com/astra-toolbox/astra-toolbox/releases>`_)::
+
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install astra_toolbox-<version>-cp313-cp313-win_amd64.whl   # standalone wheel from the ASTRA site
+   pip install -r requirements-py313.txt
+
+``astra.use_cuda()`` should return ``True`` on a CUDA-capable GPU. Note that ``pip install astra-toolbox`` from PyPI is **not** sufficient on Windows (PyPI ships Linux-only wheels) — use the standalone wheel from the ASTRA site. ``torch`` is optional and is not required for the OSMO/BCLP + ASTRA path.
+
 For more information, refer to the `installation documentation <https://vamtoolbox.readthedocs.io/en/latest/_docs/gettingstarted.html>`_.
 
 
@@ -90,32 +134,7 @@ Tomo desktop application
 ------------------------
 `Tomo <https://github.com/computed-axial-lithography/tomo>`_ is a standalone Windows desktop GUI built on top of VAMToolbox. It exposes the full pipeline — load one or more STLs, voxelize on the GPU, optimize the projections (OSMO or BCLP), then preview and export a print-ready projection video — through a guided four-stage interface (Prep → Voxelize → Optimize → Preview), with live 3D previews, absorption/diffusion correction toggles, hardware auto-tuning, and a z-slab memory mode for very large parts.
 
-Tomo is a thin front end: all voxelization, optimization, and physics are performed by VAMToolbox via the high-level ``vamtoolbox.pipeline`` API (see below). It ships as a single NSIS installer with a self-contained Python/CUDA runtime bundled in, so end users do not need to set up Python, conda, or CUDA. It is released under the same UC Regents license as VAMToolbox.
-
-
-Changes in this branch (Tomo integration, 2026-06)
---------------------------------------------------
-This branch adds the supporting library work behind the Tomo GUI and improvements for large-part, high-resolution prints. Changed/added modules (per the license's "mark your changes" requirement):
-
-1. High-level pipeline API (new ``vamtoolbox/pipeline.py``)
-
-   A clean, GUI-facing API — ``PrintConfig`` (a JSON-serializable dataclass of all job parameters, with ``.validate()``) and ``VAMPipeline`` (stateful: ``detect_hardware`` / ``voxelize`` / ``optimize`` / ``rebin`` / ``save_video`` / ``run``, with staged progress callbacks, ETA estimation, and cancellation). No environment variables or globals are required to drive a full job. Re-exported at the top level as ``vamtoolbox.PrintConfig`` / ``VAMPipeline`` / ``run_print``. Example: ``examples/gui_integration_example.py``.
-
-2. Optimization and large-volume performance
-
-   Per-iteration progress callbacks added to the OSMO and BCLP loops (for live GUI progress). Memory-scalable optimization for billion-voxel volumes via z-slab chunking in the 3D projectors (``Projector3DParallel`` / ``Projector3DParallelCUDA``), a new GPU ray-density projector (``projector/ProjectorRayDensityGPU.py``), and a low-memory BCLP variant (``optimizer/BCLP_lowmem.py``). On the CPU path, a sparse-matrix projector substantially reduces per-iteration cost.
-
-3. Resolution-aware physics corrections
-
-   Absorption (``geometry.py``) and diffusion (``response.py``) corrections now use the real physical voxel pitch rather than pixel units, so results are consistent across resolutions.
-
-4. Hardware detection (new ``vamtoolbox/util/hardware.py``)
-
-   CUDA capability detection and auto-tuning of run parameters, with a CPU fallback.
-
-5. Cleanup and packaging
-
-   ``torch`` is now an optional dependency — the imports in ``vamtoolbox/__init__.py`` and ``vamtoolbox/projector/__init__.py`` are guarded so the OSMO/BCLP + astra/sparse path runs without torch installed (enabling a much slimmer bundled runtime). Added Python 3.13 support (``requirements-py313.txt``), a ``pytest`` test suite under ``tests/``, and additional usage examples under ``examples/``.
+Tomo is a thin front end: all voxelization, optimization, and physics are performed by VAMToolbox via the high-level ``vamtoolbox.pipeline`` API (see `VAMToolbox 3.0.0 Release Notes`_). It ships as a single NSIS installer with a self-contained Python/CUDA runtime bundled in (including ASTRA), so end users do not need to set up Python, conda, or CUDA. It is released under the same UC Regents license as VAMToolbox.
 
 
 License
