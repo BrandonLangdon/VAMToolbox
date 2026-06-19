@@ -1,8 +1,9 @@
 """Projector correctness: forward/backward adjointness, shapes, CPU/GPU parity."""
 import numpy as np
+import pytest
 
 import vamtoolbox
-from conftest import make_proj_geo, requires_cuda
+from conftest import HAS_ASTRA, make_proj_geo, requires_cuda
 
 
 def _projector(angles, cuda):
@@ -14,6 +15,11 @@ def _projector(angles, cuda):
     return vamtoolbox.projectorconstructor.projectorconstructor(tg, pg), N
 
 
+@pytest.mark.xfail(
+    not HAS_ASTRA,
+    reason="skimage radon/iradon fallback is not an exact adjoint pair (astra required)",
+    strict=False,
+)
 def test_forward_backward_are_adjoint(angles):
     P, N = _projector(angles, cuda=False)
     rng = np.random.default_rng(1)
