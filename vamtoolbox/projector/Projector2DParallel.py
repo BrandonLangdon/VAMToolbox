@@ -6,9 +6,37 @@ except ImportError:
     astra = None
 import numpy as np
 from numpy.typing import NDArray
+from skimage.transform import radon, iradon
 from skimage.transform._warps import warp
 
 import vamtoolbox
+
+
+class Projector2DParallelSkimage:
+    """CPU parallel-beam 2D projector using scikit-image radon/iradon.
+
+    Drop-in replacement for Projector2DParallelAstra when astra is unavailable
+    (e.g. on macOS).  Mirrors Projector3DParallelSkimage for the single-slice
+    2D case and uses the same sinogram convention (nT x nAngles).
+    """
+
+    def __init__(self, target_geo, proj_geo):
+        self.target_geo = target_geo
+        self.proj_geo = proj_geo
+        self.angles_deg = proj_geo.angles  # degrees
+
+    def forward(self, target):
+        """Forward projector operation (b = Ax) via the Radon transform."""
+        x = vamtoolbox.util.data.clipToCircle(np.squeeze(target))
+        return radon(x, theta=self.angles_deg, circle=True)
+
+    def backward(self, sinogram):
+        """Backward projector operation (x = A^T b): unfiltered backprojection."""
+        b = sinogram
+        if self.proj_geo.zero_dose_sino is not None:
+            b[self.proj_geo.zero_dose_sino] = 0.0
+        x = iradon(b, theta=self.angles_deg, filter_name=None, circle=True)
+        return vamtoolbox.util.data.clipToCircle(x)
 
 
 class Projector2DParallelAstra:

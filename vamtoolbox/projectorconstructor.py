@@ -77,9 +77,20 @@ def projectorconstructor(
             # create new attenuation field array the size of the insert array with infinite attenuation where the insert is
             proj_geo.attenuation_field = np.where(target_geo.insert == 1, np.inf, 0)
 
-    # if GPU projection
+    # GPU projection requested.  The torch propagators (algebraic / ray_trace)
+    # manage their own CPU/GPU device selection, but the astra-based parallel
+    # projectors need astra AND a usable CUDA device.  The default 3D GPU
+    # projector (Projector3DParallelCUDAAstraChunked) defers all astra calls to
+    # forward()/backward(), so constructing it succeeds even without astra and
+    # the construction-time try/except fallbacks below never fire -- it would
+    # instead crash mid-optimization.  Detect astra+CUDA up front and fall back
+    # to the CPU branch when absent (e.g. on macOS).
+    from vamtoolbox.util import hardware
+    torch_ray = proj_geo.ray_type in ("algebraic", "ray_trace")
+    use_gpu = proj_geo.CUDA is True and (torch_ray or hardware._astra_cuda_ok())
+
     A: Projector
-    if proj_geo.CUDA is True:
+    if use_gpu:
         if proj_geo.ray_type == "algebraic":
             from vamtoolbox.projector.pyTorchAlgebraicPropagation import (
                 PyTorchAlgebraicPropagator,

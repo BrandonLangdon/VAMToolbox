@@ -54,4 +54,18 @@ print(f"\noptimize done in {time.time()-t1:.1f}s")
 print("sinogram shape:", opt_sino.array.shape)
 print("recon shape:   ", opt_recon.array.shape)
 print("final error:   ", np.asarray(error).ravel()[-1] if np.size(error) else error)
+
+# --- 2D image target, with CUDA=True requested: must transparently fall back
+# to the CPU path on a machine without astra/CUDA (rather than crashing).
+img_geo = vam.geometry.TargetGeometry(
+    imagefilename=vam.resources.load("reschart.png"), pixels=151
+)
+img_angles = np.linspace(0, 360 - 360 / 120, 120)
+pg2d = vam.geometry.ProjectionGeometry(img_angles, ray_type="parallel", CUDA=True)
+opts2d = vam.optimize.Options(
+    method="CAL", n_iter=3, d_h=0.85, d_l=0.6, filter="hamming", verbose=False
+)
+s2, r2, _ = vam.optimize.optimize(img_geo, pg2d, opts2d)
+print(f"\n2D (CUDA=True -> CPU fallback): sino {s2.array.shape} recon {r2.array.shape}")
+
 print("\n=== SMOKE TEST PASSED ===")
