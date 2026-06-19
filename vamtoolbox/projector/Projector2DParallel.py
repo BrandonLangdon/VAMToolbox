@@ -1,6 +1,9 @@
 from functools import partial
 
-import astra  # type: ignore
+try:
+    import astra  # type: ignore
+except ImportError:
+    astra = None
 import numpy as np
 from numpy.typing import NDArray
 from skimage.transform._warps import warp

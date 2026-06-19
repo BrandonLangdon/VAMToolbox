@@ -1,4 +1,7 @@
-import astra
+try:
+    import astra
+except ImportError:
+    astra = None
 
 try:
     import tigre
