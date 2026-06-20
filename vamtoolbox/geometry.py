@@ -485,7 +485,7 @@ class TargetGeometry(Volume):
         imagefilename=None,
         pixels=None,
         rot_angles=[0, 0, 0],
-        bodies="all",
+        bodies=None,
         binarize_image=True,
         clip_to_circle=True,
         options=None,
@@ -564,7 +564,7 @@ class TargetGeometry(Volume):
             else:
                 array = image
 
-            if bodies != "all":
+            if bodies not in (None, "all"):
                 print(
                     "Warning: zero dose and insert bodies are not implemented in 2D yet."
                 )
@@ -582,16 +582,19 @@ class TargetGeometry(Volume):
         elif stlfilename is not None:
             self.stlfilename = stlfilename
             array, insert, zero_dose = vamtoolbox.voxelize.voxelizeTargetOpenGL(
-                stlfilename, resolution, bodies, rot_angles
+                stlfilename, resolution, bodies if bodies is not None else "all",
+                rot_angles
             )
             self.zero_dose = zero_dose
             self.insert = insert
 
-        # 3MF file as target to voxelize (beam lattices + solid meshes)
+        # 3MF file as target to voxelize (beam lattices + solid meshes).
+        # Defaults to "auto": roles assigned from object names (see threemf).
         elif threemffilename is not None:
             self.threemffilename = threemffilename
             array, insert, zero_dose = vamtoolbox.threemf.voxelize_3mf(
-                threemffilename, resolution, bodies, rot_angles
+                threemffilename, resolution, bodies if bodies is not None else "auto",
+                rot_angles
             )
             self.zero_dose = zero_dose
             self.insert = insert

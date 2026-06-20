@@ -80,6 +80,15 @@ This major release includes a number of new features and improvements. The major
 
    Import 3MF files — including the **beam-lattice extension** (strut graphs with per-end radii and ball nodes, as produced by lattice generators such as the VolumeFillingLattice add-on + Blender 3MF Exporter) — directly as voxel targets. Solid meshes and beam lattices are read via the lib3mf SDK; beam lattices are voxelized analytically (capsule signed-distance), which scales to dense lattices and needs no GPU/OpenGL. Usage: ``TargetGeometry(threemffilename="lattice.3mf", resolution=100)`` (a ``.3mf`` passed to ``stlfilename`` is auto-routed). ``lib3mf`` is an optional dependency (``pip install lib3mf``).
 
+   **Object naming convention.** When a 3MF holds several objects (e.g. a model plus a lattice, plus inserts or zero-dose regions), each object's *role* is taken from a leading tag in its name (case-insensitive; tag followed by a separator ``_ - . :`` space, or a bracketed ``[tag]`` form):
+
+   - ``insert_…`` → **insert** (pre-existing solid, not printed)
+   - ``zerodose_…`` / ``zero_dose_…`` / ``nodose_…`` → **zero_dose** (must receive no dose)
+   - ``print_…``, ``model_…``, ``part_…``, ``body_…``, ``shell_…``, ``lattice_…``, ``solid_…`` → **print**
+   - any untagged name → **print**
+
+   This is the default (``bodies="auto"``) for 3MF import, so untagged files behave exactly as before. Pass ``bodies="all"`` to force every object into the print target, or a dict ``{"print": [...], "insert": [...], "zero_dose": [...]}`` of object names/ids to map explicitly. ``vamtoolbox.threemf.role_from_name(name)`` exposes the parser.
+
 
 Band-Contraint-Lp-norm (BCLP) minimization (contribution from `LDCT-VAM <https://github.com/facebookresearch/LDCT-VAM>`_)
 ------------
