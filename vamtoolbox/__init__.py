@@ -4,6 +4,7 @@ from . import geometry
 from . import optimize
 from . import projectorconstructor
 from . import voxelize
+from . import threemf
 from . import util
 from . import display
 from . import dlp

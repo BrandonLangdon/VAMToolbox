@@ -1,0 +1,376 @@
+"""3MF import for VAMToolbox, with beam-lattice support.
+
+Unlike the STL path (trimesh -> OpenGL rasterization of triangle meshes), 3MF
+can carry the **beam-lattice extension** (strut graphs: nodes + beams with
+per-end radii, plus optional "ball" nodes) produced by tools like the
+VolumeFillingLattice add-on + Blender 3MF Exporter. trimesh cannot read that
+extension, so we use the official lib3mf SDK to read the file, then voxelize
+beam lattices **analytically** (capsule signed-distance) into the voxel grid.
+
+Public API
+----------
+read_3mf(path) -> list[Body]
+voxelize_3mf(path, resolution, bodies="all", rot_angles=(0,0,0))
+    -> (array, insert, zero_dose)   # matches voxelize.voxelizeTargetOpenGL
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+def _require_lib3mf():
+    try:
+        import lib3mf
+    except Exception as e:  # pragma: no cover - environment dependent
+        raise ImportError(
+            "Reading 3MF files requires the lib3mf SDK. Install it with:\n"
+            "    pip install lib3mf"
+        ) from e
+    return lib3mf
+
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+@dataclass
+class Body:
+    """One built object instance from a 3MF (geometry already world-transformed)."""
+
+    name: str
+    object_id: int
+    vertices: np.ndarray                       # (N, 3) float
+    triangles: np.ndarray = field(            # (M, 3) int  (solid mesh, may be empty)
+        default_factory=lambda: np.empty((0, 3), dtype=np.int64))
+    beam_nodes: np.ndarray = field(           # (K, 2) int  (vertex indices per beam)
+        default_factory=lambda: np.empty((0, 2), dtype=np.int64))
+    beam_radii: np.ndarray = field(           # (K, 2) float (radius per beam end)
+        default_factory=lambda: np.empty((0, 2), dtype=float))
+    ball_nodes: np.ndarray = field(           # (B,) int
+        default_factory=lambda: np.empty((0,), dtype=np.int64))
+    ball_radii: np.ndarray = field(           # (B,) float
+        default_factory=lambda: np.empty((0,), dtype=float))
+    min_length: float = 0.0
+
+    @property
+    def has_beams(self) -> bool:
+        return self.beam_nodes.shape[0] > 0
+
+    @property
+    def has_mesh(self) -> bool:
+        return self.triangles.shape[0] > 0
+
+    @property
+    def has_balls(self) -> bool:
+        return self.ball_nodes.shape[0] > 0
+
+
+# --------------------------------------------------------------------------- #
+# Reading
+# --------------------------------------------------------------------------- #
+def _transform_matrix(transform) -> np.ndarray:
+    """lib3mf transform Fields is a 4x3 matrix (rows 0-2 = basis, row 3 = translation).
+    Returns a (4, 3) numpy array; apply as  v' = v @ M[:3] + M[3]."""
+    f = transform.Fields
+    return np.array([[f[i][j] for j in range(3)] for i in range(4)], dtype=float)
+
+
+def _apply(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    return pts @ M[:3, :] + M[3, :]
+
+
+def _read_mesh_object(model, obj, M: np.ndarray) -> Body:
+    lib3mf = _require_lib3mf()
+    mo = model.GetMeshObjectByID(obj.GetResourceID())
+
+    n_v = mo.GetVertexCount()
+    verts = np.empty((n_v, 3), dtype=float)
+    varr = mo.GetVertices() if n_v else []
+    for i in range(n_v):
+        verts[i] = varr[i].Coordinates
+    verts = _apply(M, verts) if n_v else verts
+
+    n_t = mo.GetTriangleCount()
+    tris = np.empty((n_t, 3), dtype=np.int64)
+    if n_t:
+        tarr = mo.GetTriangleIndices()
+        for i in range(n_t):
+            tris[i] = tarr[i].Indices
+
+    bl = mo.BeamLattice()
+    n_b = bl.GetBeamCount()
+    beam_nodes = np.empty((n_b, 2), dtype=np.int64)
+    beam_radii = np.empty((n_b, 2), dtype=float)
+    if n_b:
+        beams = bl.GetBeams()
+        for i in range(n_b):
+            beam_nodes[i] = (beams[i].Indices[0], beams[i].Indices[1])
+            beam_radii[i] = (beams[i].Radii[0], beams[i].Radii[1])
+
+    n_ball = bl.GetBallCount()
+    ball_nodes = np.empty((n_ball,), dtype=np.int64)
+    ball_radii = np.empty((n_ball,), dtype=float)
+    if n_ball:
+        balls = bl.GetBalls()
+        for i in range(n_ball):
+            ball_nodes[i] = balls[i].Index
+            ball_radii[i] = balls[i].Radius
+
+    return Body(
+        name=obj.GetName() or f"object_{obj.GetResourceID()}",
+        object_id=obj.GetResourceID(),
+        vertices=verts, triangles=tris,
+        beam_nodes=beam_nodes, beam_radii=beam_radii,
+        ball_nodes=ball_nodes, ball_radii=ball_radii,
+        min_length=float(bl.GetMinLength()),
+    )
+
+
+def _resolve_object(model, resource_id):
+    """Return the base object for a resource id (mesh or components), or None."""
+    for getter in ("GetMeshObjectByID", "GetComponentsObjectByID"):
+        fn = getattr(model, getter, None)
+        if fn is None:
+            continue
+        try:
+            return fn(resource_id)
+        except Exception:
+            continue
+    return None
+
+
+def _collect(model, obj, M: np.ndarray, out: list[Body]) -> None:
+    if obj.IsMeshObject():
+        out.append(_read_mesh_object(model, obj, M))
+    elif obj.IsComponentsObject():
+        comps = model.GetComponentsObjectByID(obj.GetResourceID())
+        for i in range(comps.GetComponentCount()):
+            comp = comps.GetComponent(i)
+            Mc = _transform_matrix(comp.GetTransform()) if comp.HasTransform() else _IDENT
+            base = _resolve_object(model, comp.GetObjectResourceID())
+            if base is not None:
+                _collect(model, base, _compose(M, Mc), out)
+    # other object types (level set, etc.) are ignored for now
+
+
+_IDENT = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 0]], dtype=float)
+
+
+def _compose(M_parent: np.ndarray, M_child: np.ndarray) -> np.ndarray:
+    """Compose two (4,3) 3MF transforms: apply child then parent."""
+    a3, at = M_child[:3], M_child[3]
+    b3, bt = M_parent[:3], M_parent[3]
+    out = np.empty((4, 3))
+    out[:3] = a3 @ b3
+    out[3] = at @ b3 + bt
+    return out
+
+
+def read_3mf(path: str) -> list[Body]:
+    """Read a 3MF file into a list of Body instances (world-transformed)."""
+    lib3mf = _require_lib3mf()
+    wrapper = lib3mf.Wrapper()
+    model = wrapper.CreateModel()
+    model.QueryReader("3mf").ReadFromFile(str(path))
+
+    bodies: list[Body] = []
+    items = model.GetBuildItems()
+    while items.MoveNext():
+        item = items.GetCurrent()
+        obj = item.GetObjectResource()
+        M = _transform_matrix(item.GetObjectTransform()) if item.HasObjectTransform() else _IDENT
+        _collect(model, obj, M, bodies)
+
+    if not bodies:  # no build items -> fall back to every mesh object
+        it = model.GetMeshObjects()
+        while it.MoveNext():
+            _collect(model, it.GetCurrentMeshObject(), _IDENT, bodies)
+    return bodies
+
+
+# --------------------------------------------------------------------------- #
+# Voxelization (analytic capsule SDF for beam lattices)
+# --------------------------------------------------------------------------- #
+@dataclass
+class _Grid:
+    xs: np.ndarray      # voxel-center x coords (len nx)
+    ys: np.ndarray      # voxel-center y coords (len ny)
+    zs: np.ndarray      # voxel-center z coords (len nz)
+    shift: np.ndarray   # world -> grid offset (subtracted from vertices)
+    shape: tuple        # (ny, nx, nz)
+
+
+def _rotation(rot_angles) -> np.ndarray:
+    """3x3 rotation from degrees about x, then y, then z (applied as v @ R.T)."""
+    rx, ry, rz = np.deg2rad(rot_angles)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def _max_radius(bodies: list[Body]) -> float:
+    r = 0.0
+    for b in bodies:
+        if b.has_beams:
+            r = max(r, float(b.beam_radii.max()))
+        if b.has_balls:
+            r = max(r, float(b.ball_radii.max()))
+    return r
+
+
+def _build_grid(bodies: list[Body], resolution: int) -> _Grid:
+    """Square-XY, z-layered grid matching VAMToolbox's convention: object centered
+    in XY, z starting at 0, sized so all geometry fits within the inscribed
+    circle (for clip_to_circle). Padded by the max strut/ball radius."""
+    pts = np.vstack([b.vertices for b in bodies])
+    max_r = _max_radius(bodies)
+    cx = (pts[:, 0].min() + pts[:, 0].max()) / 2
+    cy = (pts[:, 1].min() + pts[:, 1].max()) / 2
+    z_min = pts[:, 2].min()
+    shift = np.array([cx, cy, z_min - max_r])
+
+    z_extent = (pts[:, 2].max() - pts[:, 2].min()) + 2 * max_r
+    z_extent = max(z_extent, 1e-9)
+    cxy = pts[:, :2] - np.array([cx, cy])
+    R = float(np.max(np.hypot(cxy[:, 0], cxy[:, 1]))) + max_r
+    R = max(R, 1e-9)
+
+    lt = z_extent / resolution
+    nx = ny = max(1, int(round(2 * R / lt)))
+    nz = int(resolution)
+    xs = -R + (np.arange(nx) + 0.5) * (2 * R / nx)
+    ys = -R + (np.arange(ny) + 0.5) * (2 * R / ny)
+    zs = (np.arange(nz) + 0.5) * lt
+    return _Grid(xs, ys, zs, shift, (ny, nx, nz))
+
+
+def _sub_range(coords: np.ndarray, lo: float, hi: float) -> tuple[int, int]:
+    i0 = int(np.searchsorted(coords, lo, side="left"))
+    i1 = int(np.searchsorted(coords, hi, side="right"))
+    return max(0, i0), min(len(coords), i1)
+
+
+def _fill_capsule(arr, g: _Grid, p0, p1, r0, r1) -> None:
+    rmax = max(r0, r1)
+    lo = np.minimum(p0, p1) - rmax
+    hi = np.maximum(p0, p1) + rmax
+    ix0, ix1 = _sub_range(g.xs, lo[0], hi[0])
+    iy0, iy1 = _sub_range(g.ys, lo[1], hi[1])
+    iz0, iz1 = _sub_range(g.zs, lo[2], hi[2])
+    if ix0 >= ix1 or iy0 >= iy1 or iz0 >= iz1:
+        return
+    sy, sx, sz = g.ys[iy0:iy1], g.xs[ix0:ix1], g.zs[iz0:iz1]
+    YY, XX, ZZ = np.meshgrid(sy, sx, sz, indexing="ij")  # match arr[iy, ix, iz]
+    P = np.stack([XX, YY, ZZ], axis=-1)
+    d = p1 - p0
+    L2 = float(d @ d)
+    if L2 > 0:
+        t = np.clip(((P - p0) @ d) / L2, 0.0, 1.0)
+    else:
+        t = np.zeros(P.shape[:-1])
+    closest = p0 + t[..., None] * d
+    dist = np.linalg.norm(P - closest, axis=-1)
+    r_at = r0 + t * (r1 - r0)
+    mask = dist <= r_at
+    sub = arr[iy0:iy1, ix0:ix1, iz0:iz1]
+    sub[mask] = 1
+
+
+def _fill_sphere(arr, g: _Grid, center, radius) -> None:
+    lo = center - radius
+    hi = center + radius
+    ix0, ix1 = _sub_range(g.xs, lo[0], hi[0])
+    iy0, iy1 = _sub_range(g.ys, lo[1], hi[1])
+    iz0, iz1 = _sub_range(g.zs, lo[2], hi[2])
+    if ix0 >= ix1 or iy0 >= iy1 or iz0 >= iz1:
+        return
+    sy, sx, sz = g.ys[iy0:iy1], g.xs[ix0:ix1], g.zs[iz0:iz1]
+    YY, XX, ZZ = np.meshgrid(sy, sx, sz, indexing="ij")
+    dist = np.sqrt((XX - center[0]) ** 2 + (YY - center[1]) ** 2 + (ZZ - center[2]) ** 2)
+    sub = arr[iy0:iy1, ix0:ix1, iz0:iz1]
+    sub[dist <= radius] = 1
+
+
+def _fill_mesh(arr, g: _Grid, verts, tris) -> None:
+    """Solid voxelization of a triangle mesh via point-in-mesh containment,
+    restricted to the mesh AABB sub-grid."""
+    import trimesh
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    lo, hi = verts.min(0), verts.max(0)
+    ix0, ix1 = _sub_range(g.xs, lo[0], hi[0])
+    iy0, iy1 = _sub_range(g.ys, lo[1], hi[1])
+    iz0, iz1 = _sub_range(g.zs, lo[2], hi[2])
+    if ix0 >= ix1 or iy0 >= iy1 or iz0 >= iz1:
+        return
+    sy, sx, sz = g.ys[iy0:iy1], g.xs[ix0:ix1], g.zs[iz0:iz1]
+    YY, XX, ZZ = np.meshgrid(sy, sx, sz, indexing="ij")
+    pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=-1)
+    inside = mesh.contains(pts).reshape(XX.shape)
+    sub = arr[iy0:iy1, ix0:ix1, iz0:iz1]
+    sub[inside] = 1
+
+
+def _fill_body(arr, g: _Grid, body: Body) -> None:
+    v = body.vertices - g.shift
+    for (i, j), (r0, r1) in zip(body.beam_nodes, body.beam_radii):
+        _fill_capsule(arr, g, v[i], v[j], float(r0), float(r1))
+    for idx, r in zip(body.ball_nodes, body.ball_radii):
+        _fill_sphere(arr, g, v[idx], float(r))
+    if body.has_mesh and not body.has_beams:
+        _fill_mesh(arr, g, v, body.triangles)
+
+
+def _assign_groups(bodies: list[Body], bodies_map) -> dict:
+    """Map bodies to print/insert/zero_dose. `bodies_map` is "all" or a dict
+    {"print": [...], "insert": [...], "zero_dose": [...]} of names or object ids."""
+    groups = {"print": [], "insert": [], "zero_dose": []}
+    if bodies_map == "all" or bodies_map is None:
+        groups["print"] = list(bodies)
+        return groups
+    by_name = {b.name: b for b in bodies}
+    by_id = {b.object_id: b for b in bodies}
+    for key in groups:
+        for sel in bodies_map.get(key, []):
+            b = by_name.get(sel) or by_id.get(sel)
+            if b is not None:
+                groups[key].append(b)
+    return groups
+
+
+def _vox_group(bodies: list[Body], g: _Grid) -> np.ndarray | None:
+    if not bodies:
+        return None
+    arr = np.zeros(g.shape, dtype=np.uint8)
+    for b in bodies:
+        _fill_body(arr, g, b)
+    return arr
+
+
+def voxelize_3mf(path: str, resolution: int, bodies="all",
+                 rot_angles=(0, 0, 0)):
+    """Voxelize a 3MF (beam lattices + solid meshes) into VAMToolbox target arrays.
+
+    Drop-in analogue of voxelize.voxelizeTargetOpenGL: returns
+    (array, insert, zero_dose) with array shape (nY, nX, nZ), dtype uint8.
+    """
+    parsed = read_3mf(path)
+    if not parsed:
+        raise ValueError(f"No printable objects found in 3MF: {path}")
+    if np.any(rot_angles):
+        R = _rotation(rot_angles)
+        for b in parsed:
+            b.vertices = b.vertices @ R.T
+    grid = _build_grid(parsed, resolution)
+    groups = _assign_groups(parsed, bodies)
+    arr_print = _vox_group(groups["print"], grid)
+    if arr_print is None:  # nothing mapped to print -> voxelize everything
+        arr_print = _vox_group(parsed, grid)
+    arr_insert = _vox_group(groups["insert"], grid)
+    arr_zero = _vox_group(groups["zero_dose"], grid)
+    return arr_print, arr_insert, arr_zero
