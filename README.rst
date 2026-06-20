@@ -76,6 +76,10 @@ This major release includes a number of new features and improvements. The major
 
    Major performance improvement over pure python voxelizers. This is important for voxelizing large objects at high resolution. Please refer to `voxelizestl <https://github.com/computed-axial-lithography/VAMToolbox/blob/main/examples/voxelizestl.py>`_ for example usage. This is also available as a standalone package `OpenGL Voxelizer <https://github.com/computed-axial-lithography/OpenGL-voxelizer>`_.
 
+4. 3MF import (with beam-lattice support)
+
+   Import 3MF files — including the **beam-lattice extension** (strut graphs with per-end radii and ball nodes, as produced by lattice generators such as the VolumeFillingLattice add-on + Blender 3MF Exporter) — directly as voxel targets. Solid meshes and beam lattices are read via the lib3mf SDK; beam lattices are voxelized analytically (capsule signed-distance), which scales to dense lattices and needs no GPU/OpenGL. Usage: ``TargetGeometry(threemffilename="lattice.3mf", resolution=100)`` (a ``.3mf`` passed to ``stlfilename`` is auto-routed). ``lib3mf`` is an optional dependency (``pip install lib3mf``).
+
 
 Band-Contraint-Lp-norm (BCLP) minimization (contribution from `LDCT-VAM <https://github.com/facebookresearch/LDCT-VAM>`_)
 ------------

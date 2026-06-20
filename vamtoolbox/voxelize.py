@@ -260,7 +260,13 @@ class ShaderProgram:
         self,
     ):
         self._compileShaders()
-        self.id = shaders.compileProgram(self.vert_shader, self.frag_shader)
+        # validate=False: glValidateProgram is a diagnostic that, on macOS core
+        # profile, fails with "No vertex array object bound" because no VAO is
+        # bound at link time (the program is still valid). Skipping it keeps
+        # voxelization working on macOS without affecting Windows/Linux.
+        self.id = shaders.compileProgram(
+            self.vert_shader, self.frag_shader, validate=False
+        )
 
     def use(self):
         glUseProgram(self.id)

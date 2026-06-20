@@ -1,4 +1,7 @@
-import astra  # type: ignore
+try:
+    import astra  # type: ignore
+except ImportError:
+    astra = None
 import numpy as np
 
 import vamtoolbox

@@ -25,6 +25,21 @@ HAS_CUDA = _detect_cuda()
 requires_cuda = pytest.mark.skipif(not HAS_CUDA, reason="no CUDA device")
 
 
+def _detect_astra():
+    try:
+        import astra  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# Astra provides the exact-adjoint CPU (sparse) and GPU projectors.  Without it
+# the CPU path falls back to skimage radon/iradon, which is NOT an exact adjoint
+# pair -- tests asserting adjointness are xfailed in that case (e.g. on macOS).
+HAS_ASTRA = _detect_astra()
+requires_astra = pytest.mark.skipif(not HAS_ASTRA, reason="astra not installed")
+
+
 def make_proj_geo(angles, cuda=False, **kwargs):
     """ProjectionGeometry helper.  CPU path uses the sparse projector."""
     pg = vamtoolbox.geometry.ProjectionGeometry(

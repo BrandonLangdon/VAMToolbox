@@ -480,6 +480,7 @@ class TargetGeometry(Volume):
         self,
         target=None,
         stlfilename=None,
+        threemffilename=None,
         resolution=None,
         imagefilename=None,
         pixels=None,
@@ -517,7 +518,14 @@ class TargetGeometry(Volume):
 
         >>> t = TargetGeometry(stlfilename="example.stl",resolution=100,rot_angles=[90,0,0])
 
+        3MF file target to voxelize (supports the beam-lattice extension)
+
+        >>> t = TargetGeometry(threemffilename="lattice.3mf",resolution=100)
+
         """
+        # A .3mf passed as stlfilename is routed to the 3MF importer too.
+        if stlfilename is not None and str(stlfilename).lower().endswith(".3mf"):
+            threemffilename, stlfilename = stlfilename, None
         self.insert = None
         self.zero_dose = None
 
@@ -575,6 +583,15 @@ class TargetGeometry(Volume):
             self.stlfilename = stlfilename
             array, insert, zero_dose = vamtoolbox.voxelize.voxelizeTargetOpenGL(
                 stlfilename, resolution, bodies, rot_angles
+            )
+            self.zero_dose = zero_dose
+            self.insert = insert
+
+        # 3MF file as target to voxelize (beam lattices + solid meshes)
+        elif threemffilename is not None:
+            self.threemffilename = threemffilename
+            array, insert, zero_dose = vamtoolbox.threemf.voxelize_3mf(
+                threemffilename, resolution, bodies, rot_angles
             )
             self.zero_dose = zero_dose
             self.insert = insert
