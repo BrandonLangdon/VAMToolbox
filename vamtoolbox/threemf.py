@@ -15,9 +15,52 @@ voxelize_3mf(path, resolution, bodies="all", rot_angles=(0,0,0))
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
+
+# --------------------------------------------------------------------------- #
+# Naming convention: an object's role is taken from a leading tag in its name.
+#
+#   insert_handle        -> insert        zerodose_port   -> zero_dose
+#   lattice_infill       -> print         [insert] handle -> insert  (bracket form)
+#   my_part              -> print         (no recognized tag -> print)
+#
+# Matching is case-insensitive; the tag must be followed by a separator
+# (_ - . : or space) or the end of the name. Aliases (model/part/body/shell/
+# lattice/solid) all map to `print`; the matched keyword is preserved on Body.tag.
+# --------------------------------------------------------------------------- #
+ROLE_ALIASES = {
+    "insert": "insert",
+    "zerodose": "zero_dose", "zero_dose": "zero_dose", "zero-dose": "zero_dose",
+    "nodose": "zero_dose", "no_dose": "zero_dose", "no-dose": "zero_dose",
+    "print": "print", "model": "print", "part": "print", "body": "print",
+    "shell": "print", "lattice": "print", "solid": "print",
+}
+_SEP = r"(?=$|[ _\-.:])"  # tag must end at a separator or string end
+
+
+def role_from_name(name: str) -> tuple[str, str | None]:
+    """Map a 3MF object name to (role, matched_tag) using the naming convention.
+
+    Returns ("print", None) when no recognized tag is present.
+    """
+    if not name:
+        return "print", None
+    s = name.strip().lower()
+    # bracketed form: [tag] rest   or   (tag) rest
+    m = re.match(r"^[\[\(]\s*([a-z0-9 _\-]+?)\s*[\]\)]", s)
+    if m:
+        cand = m.group(1).strip()
+        role = ROLE_ALIASES.get(cand) or ROLE_ALIASES.get(cand.replace(" ", "_"))
+        if role:
+            return role, cand
+    # prefix form: longest matching keyword followed by a separator
+    for kw in sorted(ROLE_ALIASES, key=len, reverse=True):
+        if re.match("^" + re.escape(kw) + _SEP, s):
+            return ROLE_ALIASES[kw], kw
+    return "print", None
 
 
 def _require_lib3mf():
@@ -52,6 +95,8 @@ class Body:
     ball_radii: np.ndarray = field(           # (B,) float
         default_factory=lambda: np.empty((0,), dtype=float))
     min_length: float = 0.0
+    role: str = "print"                       # print | insert | zero_dose
+    tag: str | None = None                    # the matched name keyword (e.g. "lattice")
 
     @property
     def has_beams(self) -> bool:
@@ -327,10 +372,23 @@ def _fill_body(arr, g: _Grid, body: Body) -> None:
 
 
 def _assign_groups(bodies: list[Body], bodies_map) -> dict:
-    """Map bodies to print/insert/zero_dose. `bodies_map` is "all" or a dict
-    {"print": [...], "insert": [...], "zero_dose": [...]} of names or object ids."""
+    """Map bodies to print/insert/zero_dose.
+
+    `bodies_map` is one of:
+      "auto"  - assign by the object-name convention (see role_from_name)
+      "all"   - everything -> print (escape hatch)
+      dict    - {"print": [...], "insert": [...], "zero_dose": [...]} of
+                object names or ids
+    """
     groups = {"print": [], "insert": [], "zero_dose": []}
+    if bodies_map == "auto":
+        for b in bodies:
+            b.role, b.tag = role_from_name(b.name)
+            groups[b.role].append(b)
+        return groups
     if bodies_map == "all" or bodies_map is None:
+        for b in bodies:
+            b.role, b.tag = "print", None
         groups["print"] = list(bodies)
         return groups
     by_name = {b.name: b for b in bodies}
@@ -339,6 +397,7 @@ def _assign_groups(bodies: list[Body], bodies_map) -> dict:
         for sel in bodies_map.get(key, []):
             b = by_name.get(sel) or by_id.get(sel)
             if b is not None:
+                b.role = key
                 groups[key].append(b)
     return groups
 
@@ -352,12 +411,16 @@ def _vox_group(bodies: list[Body], g: _Grid) -> np.ndarray | None:
     return arr
 
 
-def voxelize_3mf(path: str, resolution: int, bodies="all",
+def voxelize_3mf(path: str, resolution: int, bodies="auto",
                  rot_angles=(0, 0, 0)):
     """Voxelize a 3MF (beam lattices + solid meshes) into VAMToolbox target arrays.
 
     Drop-in analogue of voxelize.voxelizeTargetOpenGL: returns
     (array, insert, zero_dose) with array shape (nY, nX, nZ), dtype uint8.
+
+    `bodies` defaults to "auto" (assign roles by the object-name convention,
+    see role_from_name). Pass "all" to force every object into the print target,
+    or a dict to map explicitly.
     """
     parsed = read_3mf(path)
     if not parsed:
@@ -369,8 +432,8 @@ def voxelize_3mf(path: str, resolution: int, bodies="all",
     grid = _build_grid(parsed, resolution)
     groups = _assign_groups(parsed, bodies)
     arr_print = _vox_group(groups["print"], grid)
-    if arr_print is None:  # nothing mapped to print -> voxelize everything
-        arr_print = _vox_group(parsed, grid)
+    if arr_print is None:  # no object mapped to print -> empty target
+        arr_print = np.zeros(grid.shape, dtype=np.uint8)
     arr_insert = _vox_group(groups["insert"], grid)
     arr_zero = _vox_group(groups["zero_dose"], grid)
     return arr_print, arr_insert, arr_zero

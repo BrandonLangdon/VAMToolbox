@@ -89,3 +89,75 @@ def test_targetgeometry_threemf(tmp_path):
     # .3mf passed via stlfilename is auto-routed
     tg2 = vamtoolbox.geometry.TargetGeometry(stlfilename=str(p), resolution=32)
     assert (tg2.array > 0).any()
+
+
+# --------------------------------------------------------------------------- #
+# Naming convention
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("name,role", [
+    ("insert_handle", "insert"),
+    ("Insert-Pin", "insert"),
+    ("zerodose_port", "zero_dose"),
+    ("zero_dose_channel", "zero_dose"),
+    ("zero-dose.x", "zero_dose"),
+    ("nodose_region", "zero_dose"),
+    ("lattice_infill", "print"),
+    ("shell.outer", "print"),
+    ("model 1", "print"),
+    ("my_part", "print"),
+    ("[insert] handle", "insert"),
+    ("(zerodose) cooling", "zero_dose"),
+    ("[lattice] core", "print"),
+    ("models_x", "print"),      # 'models' is not an alias
+    ("inserttab", "print"),     # no separator after 'insert'
+    ("", "print"),
+])
+def test_role_from_name(name, role):
+    assert threemf.role_from_name(name)[0] == role
+
+
+def _write_named_lattices(path, names):
+    w = lib3mf.Wrapper()
+    model = w.CreateModel()
+    for k, name in enumerate(names):
+        mesh = model.AddMeshObject()
+        mesh.SetName(name)
+        ox = 10 * k
+        for (x, y, z) in [(ox, 0, 0), (ox + 6, 0, 0), (ox + 6, 6, 0),
+                          (ox, 6, 0), (ox + 3, 3, 6)]:
+            pos = lib3mf.Position()
+            pos.Coordinates = (float(x), float(y), float(z))
+            mesh.AddVertex(pos)
+        bl = mesh.BeamLattice()
+        bl.SetMinLength(0.001)
+        for (a, b) in [(4, 0), (4, 1), (4, 2), (4, 3)]:
+            beam = lib3mf.Beam()
+            beam.Indices = (a, b)
+            beam.Radii = (0.8, 0.8)
+            bl.AddBeam(beam)
+        model.AddBuildItem(mesh, w.GetIdentityTransform())
+    model.QueryWriter("3mf").WriteToFile(str(path))
+
+
+def test_auto_role_assignment(tmp_path):
+    p = tmp_path / "multi.3mf"
+    _write_named_lattices(p, ["lattice_infill", "insert_pin", "zerodose_channel"])
+    arr, insert, zero = threemf.voxelize_3mf(str(p), resolution=48, bodies="auto")
+    assert (arr > 0).any()           # lattice_infill -> print
+    assert insert is not None and (insert > 0).any()      # insert_pin
+    assert zero is not None and (zero > 0).any()          # zerodose_channel
+
+
+def test_all_mode_forces_print(tmp_path):
+    p = tmp_path / "multi.3mf"
+    _write_named_lattices(p, ["lattice_infill", "insert_pin", "zerodose_channel"])
+    arr, insert, zero = threemf.voxelize_3mf(str(p), resolution=48, bodies="all")
+    assert (arr > 0).any() and insert is None and zero is None
+
+
+def test_targetgeometry_defaults_to_auto(tmp_path):
+    p = tmp_path / "multi.3mf"
+    _write_named_lattices(p, ["lattice_infill", "insert_pin", "zerodose_channel"])
+    tg = vamtoolbox.geometry.TargetGeometry(threemffilename=str(p), resolution=40)
+    assert tg.insert is not None and (tg.insert > 0).any()
+    assert tg.zero_dose is not None and (tg.zero_dose > 0).any()
