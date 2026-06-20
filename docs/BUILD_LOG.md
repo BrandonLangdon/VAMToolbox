@@ -172,11 +172,10 @@ requirement.
 151²×100, 360 angles: 0.27 s vs 2.9 s per forward+backward), with no behavior
 change for existing users and no new mandatory dependency.
 
-**Known limitation.** Metal (like ASTRA's parallel path) does **not** handle
-attenuation/occlusion. A 3MF with an **insert** sets an attenuation field, which
-routes to the slow `Projector3DParallelPython` (~5.7 s/iter vs ~50 ms/iter). This
-is correct, not a regression. Adding a masked ray-integration variant to the Metal
-kernel is the obvious follow-up to make insert-bearing parts fast too.
+**Known limitation (resolved 2026-06-20 — see the occlusion entry below).** As
+first shipped, Metal did not handle occlusion; a 3MF with an **insert** routed to
+the slow `Projector3DParallelPython`. This was later addressed with occlusion-aware
+Metal kernels.
 
 **Status.** Done on branch `metal-projector` (VAMToolbox), pushed to GitHub.
 `metalbackend.py`, `Projector3DParallelMetal.py`, constructor wiring,
@@ -203,6 +202,49 @@ changes.
 
 **Status.** Chain verified. Open follow-ups: Metal attenuation support; open the
 `metal-projector` PR.
+
+---
+
+## 2026-06-20 — Metal occlusion (insert shadowing) support
+
+**Context.** The one remaining slow path: a 3MF with an **insert** sets an
+attenuation field, routing to `Projector3DParallelPython` (~5.7 s/iter). That
+projector models an insert as a hard **occlusion** — an opaque object casts a
+shadow, and everything behind it along the ray gets zero contribution. It
+precomputes an "occlusion sinogram" (the insert's leading-edge depth per
+detector/angle/slice) and masks both forward and backward by it.
+
+**Decision.** Add three occlusion-aware MSL kernels — `occ_sino` (build the
+occlusion sinogram), `radon_fwd_occ`, `radon_bwd_occ` — and route the
+`attenuation_field is not None` 3D-parallel case to the Metal projector.
+`Projector3DParallelMetal` precomputes the occlusion sinogram once in `__init__`
+(it is fixed for the projector's life) and the kernels add a per-ray shadow test.
+
+**Key decisions / subtleties.**
+- **Match `Projector3DParallelPython`, not skimage.** Its backward is a *raw*
+  unfiltered backprojection with **no** `π/(2·nA)` scaling (unlike skimage
+  `iradon`). The occlusion backward kernel omits the scaling to be a true drop-in
+  for that projector, so the insert case behaves exactly as before.
+- **NaN handling.** The CPU occlusion sinogram uses `NaN` where a ray misses the
+  insert, and `np.interp` propagates `NaN` (→ un-shadowed). The kernel uses a
+  large sentinel and replicates the propagation at shadow boundaries.
+
+**Why.** Makes insert-bearing parts as fast as the rest: ~41× faster end-to-end
+(12 OSMO iters with an insert: 0.07 s vs 2.84 s), with recon correlation 0.99895
+vs the Python projector. Forward and the occlusion sinogram match the CPU path
+exactly; backward differs only on a thin shadow-edge voxel shell that washes out
+over optimization.
+
+**Alternatives considered.** Beer-Lambert continuous absorption in the kernel
+(rejected for now — the codebase models inserts as binary occlusion, not
+continuous attenuation; `absorption_coeff` is a separate multiplicative mask the
+non-occlusion path already handles). Keeping inserts on the CPU projector
+(rejected — that was the whole slow path we set out to fix).
+
+**Status.** Done on branch `metal-projector`. Three new kernels +
+`occlusion_sinogram`/`forward_occ`/`backward_occ` backend methods, projector and
+constructor wiring, README item 6 updated, 4 new tests. Full suite: 70 passed,
+1 skipped, 1 xfailed.
 
 ---
 ```

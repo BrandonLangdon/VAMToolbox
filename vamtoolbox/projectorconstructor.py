@@ -165,18 +165,41 @@ def projectorconstructor(
         else:
             # if absorption or occlusion
             if proj_geo.attenuation_field is not None:
-                if target_geo.n_dim == 2:
-                    from vamtoolbox.projector.Projector2DParallel import (
-                        Projector2DParallelPython,
-                    )
+                # Apple Metal occlusion projector (insert shadowing): a fast
+                # drop-in for the slow Projector3DParallelPython.  Preferred for
+                # 3D parallel-beam occlusion when a Metal device is available;
+                # set proj_geo.metal = False to disable.
+                A = None
+                occ_metal = (
+                    getattr(proj_geo, "metal", None) is not False
+                    and target_geo.n_dim != 2
+                    and proj_geo.ray_type == "parallel"
+                    and getattr(proj_geo, "inclination_angle", None) in (None, 0)
+                    and hardware._metal_ok()
+                )
+                if occ_metal:
+                    try:
+                        from vamtoolbox.projector.Projector3DParallelMetal import (
+                            Projector3DParallelMetal,
+                        )
+                        A = Projector3DParallelMetal(target_geo, proj_geo)
+                    except Exception as e:
+                        print(f"  [projectorconstructor] Metal occlusion projector "
+                              f"unavailable ({e}); falling back to CPU.")
+                        A = None
+                if A is None:
+                    if target_geo.n_dim == 2:
+                        from vamtoolbox.projector.Projector2DParallel import (
+                            Projector2DParallelPython,
+                        )
 
-                    A = Projector2DParallelPython(target_geo, proj_geo)
-                else:
-                    from vamtoolbox.projector.Projector3DParallel import (
-                        Projector3DParallelPython,
-                    )
+                        A = Projector2DParallelPython(target_geo, proj_geo)
+                    else:
+                        from vamtoolbox.projector.Projector3DParallel import (
+                            Projector3DParallelPython,
+                        )
 
-                    A = Projector3DParallelPython(target_geo, proj_geo)
+                        A = Projector3DParallelPython(target_geo, proj_geo)
 
             else:
                 metal_pref = getattr(proj_geo, "metal", None)

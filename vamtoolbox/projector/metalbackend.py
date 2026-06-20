@@ -140,6 +140,145 @@ kernel void radon_bwd(const device float* sino    [[buffer(0)]],
     }
     out[gid] = acc;
 }
+
+// --------------------------------------------------------------------------- //
+// Occlusion (insert shadowing) variants
+//
+// An opaque insert casts a hard shadow: along each ray, everything past the
+// insert's leading edge receives nothing.  occ_sino computes, per (detector,
+// angle, slice), the smallest y = (rr - center) at which the rotated insert is
+// present (NO_OCC = +1e9 sentinel where the ray misses the insert).  The forward
+// and backward occlusion kernels then skip shadowed samples.  Reproduces
+// Projector3DParallelPython's generateOccSinogram / occ_shadow / getOccShadow.
+// --------------------------------------------------------------------------- //
+
+constant float NO_OCC = 1.0e9f;
+
+// occ_min[z, i, cc] = min over rr of (rr - center) where insert(rotated) > 0.
+// Layout matches radon_fwd output: (z, angle, det).
+kernel void occ_sino(const device float* insert  [[buffer(0)]],
+                     const device float* cossin  [[buffer(1)]],
+                     const device int*   dims     [[buffer(2)]],
+                     device float*       out      [[buffer(3)]],
+                     uint gid [[thread_position_in_grid]]) {
+    int N  = dims[0];
+    int nA = dims[1];
+    int nZ = dims[2];
+    long total = (long)N * nA * nZ;
+    if ((long)gid >= total) return;
+
+    int cc = (int)(gid % (uint)N);
+    int i  = (int)((gid / (uint)N) % (uint)nA);
+    int z  = (int)(gid / (uint)(N * nA));
+
+    float cosa = cossin[2 * i];
+    float sina = cossin[2 * i + 1];
+    float center = (float)(N / 2);
+    const device float* img = insert + (long)z * N * N;
+
+    float bx = cosa * (float)cc - center * (cosa + sina - 1.0f);
+    float by = -sina * (float)cc - center * (cosa - sina - 1.0f);
+
+    float occ = NO_OCC;
+    for (int rr = 0; rr < N; ++rr) {
+        float x_in = bx + sina * (float)rr;
+        float y_in = by + cosa * (float)rr;
+        if (samp(img, N, x_in, y_in) > 0.0f) {
+            occ = (float)rr - center;   // smallest rr wins; first hit
+            break;
+        }
+    }
+    out[gid] = occ;
+}
+
+// Forward projection with occlusion: integrate only un-shadowed samples.
+kernel void radon_fwd_occ(const device float* vol     [[buffer(0)]],
+                          const device float* cossin  [[buffer(1)]],
+                          const device int*   dims     [[buffer(2)]],
+                          const device float* occ      [[buffer(3)]],
+                          device float*       out      [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    int N  = dims[0];
+    int nA = dims[1];
+    int nZ = dims[2];
+    long total = (long)N * nA * nZ;
+    if ((long)gid >= total) return;
+
+    int cc = (int)(gid % (uint)N);
+    int i  = (int)((gid / (uint)N) % (uint)nA);
+    int z  = (int)(gid / (uint)(N * nA));
+
+    float cosa = cossin[2 * i];
+    float sina = cossin[2 * i + 1];
+    float center = (float)(N / 2);
+    const device float* img = vol + (long)z * N * N;
+    float occm = occ[gid];
+
+    float bx = cosa * (float)cc - center * (cosa + sina - 1.0f);
+    float by = -sina * (float)cc - center * (cosa - sina - 1.0f);
+
+    float acc = 0.0f;
+    for (int rr = 0; rr < N; ++rr) {
+        if ((float)rr - center > occm) continue;   // shadowed by the insert
+        float x_in = bx + sina * (float)rr;
+        float y_in = by + cosa * (float)rr;
+        acc += samp(img, N, x_in, y_in);
+    }
+    out[gid] = acc;
+}
+
+// Unfiltered back projection with occlusion: skip shadowed pixels per angle.
+kernel void radon_bwd_occ(const device float* sino    [[buffer(0)]],
+                          const device float* cossin  [[buffer(1)]],
+                          const device int*   dims     [[buffer(2)]],
+                          const device float* occ      [[buffer(3)]],
+                          device float*       out      [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    int N  = dims[0];
+    int nA = dims[1];
+    int nZ = dims[2];
+    long total = (long)N * N * nZ;
+    if ((long)gid >= total) return;
+
+    int C0 = (int)(gid % (uint)N);
+    int R0 = (int)((gid / (uint)N) % (uint)N);
+    int z  = (int)(gid / (uint)(N * N));
+
+    int radius = N / 2;
+    float xpr = (float)(R0 - radius);
+    float ypr = (float)(C0 - radius);
+
+    float acc = 0.0f;
+    if (xpr * xpr + ypr * ypr <= (float)(radius * radius)) {
+        const device float* base = sino + (long)z * nA * N;
+        const device float* obase = occ + (long)z * nA * N;
+        float center = (float)(N / 2);
+        for (int i = 0; i < nA; ++i) {
+            float cosa = cossin[2 * i];
+            float sina = cossin[2 * i + 1];
+            float t = ypr * cosa - xpr * sina;       // detector coordinate
+            float s = ypr * sina + xpr * cosa;       // depth along the ray
+            float pos = t + center;
+            if (pos < 0.0f || pos > (float)(N - 1)) continue;
+            int p0 = (int)floor(pos);
+            float fp = pos - (float)p0;
+            // occlusion: interpolate the insert edge at t; shadowed if s past it.
+            // np.interp propagates NaN, so if either neighbour is the miss
+            // sentinel treat the pixel as un-shadowed (matches the CPU path).
+            float o0 = obase[i * N + p0];
+            float o1 = (p0 + 1 <= N - 1) ? obase[i * N + p0 + 1] : NO_OCC;
+            float occv = (o0 >= 0.5f * NO_OCC || o1 >= 0.5f * NO_OCC)
+                         ? NO_OCC : (1.0f - fp) * o0 + fp * o1;
+            if (s > floor(occv)) continue;           // shadowed -> no dose
+            float c0v = base[i * N + p0];
+            float c1v = (p0 + 1 <= N - 1) ? base[i * N + p0 + 1] : 0.0f;
+            acc += (1.0f - fp) * c0v + fp * c1v;
+        }
+        // NOTE: no pi/(2*nA) scaling -- Projector3DParallelPython's backward is a
+        // raw unfiltered backprojection, and this is its drop-in replacement.
+    }
+    out[gid] = acc;
+}
 """
 
 
@@ -171,6 +310,9 @@ class MetalProjectorBackend:
             lib = self.dev.kernel(_MSL_SOURCE)
             self._fwd = lib.function("radon_fwd")
             self._bwd = lib.function("radon_bwd")
+            self._occ = lib.function("occ_sino")
+            self._fwd_occ = lib.function("radon_fwd_occ")
+            self._bwd_occ = lib.function("radon_bwd_occ")
         except Exception as e:  # pragma: no cover - hardware dependent
             raise MetalUnavailable(f"Metal init failed: {e}") from e
 
@@ -209,4 +351,51 @@ class MetalProjectorBackend:
         dims = np.array([N, nA, nZ], dtype=np.int32)
         out = self.dev.buffer(nZ * N * N * 4)
         self._bwd(nZ * N * N, sino, cossin, dims, out)
+        return np.frombuffer(out, dtype=np.float32).reshape(nZ, N, N)
+
+    # ----------------------------------------------------------------------- #
+    # Occlusion (insert shadowing) variants
+    # ----------------------------------------------------------------------- #
+    def occlusion_sinogram(self, insert_zrc: np.ndarray,
+                           angles_deg: np.ndarray) -> np.ndarray:
+        """insert mask (nZ, N, N) -> occlusion sinogram (nZ, nA, N), float32.
+
+        Per (slice, angle, detector): the insert's leading-edge depth, or a
+        large sentinel where the ray misses the insert.  Compute once and pass
+        to forward_occ / backward_occ."""
+        nZ, N, N2 = insert_zrc.shape
+        assert N == N2, "slices must be square"
+        nA = int(np.asarray(angles_deg).size)
+        insert = np.ascontiguousarray(insert_zrc, dtype=np.float32)
+        cossin = self._cossin(angles_deg)
+        dims = np.array([N, nA, nZ], dtype=np.int32)
+        out = self.dev.buffer(nZ * nA * N * 4)
+        self._occ(nZ * nA * N, insert, cossin, dims, out)
+        return np.frombuffer(out, dtype=np.float32).reshape(nZ, nA, N)
+
+    def forward_occ(self, vol_zrc: np.ndarray, angles_deg: np.ndarray,
+                    occ_zad: np.ndarray) -> np.ndarray:
+        """Occlusion-aware forward.  vol (nZ,N,N), occ (nZ,nA,N) -> (nZ,nA,N)."""
+        nZ, N, N2 = vol_zrc.shape
+        nA = int(np.asarray(angles_deg).size)
+        vol = np.ascontiguousarray(vol_zrc, dtype=np.float32)
+        occ = np.ascontiguousarray(occ_zad, dtype=np.float32)
+        cossin = self._cossin(angles_deg)
+        dims = np.array([N, nA, nZ], dtype=np.int32)
+        out = self.dev.buffer(nZ * nA * N * 4)
+        self._fwd_occ(nZ * nA * N, vol, cossin, dims, occ, out)
+        return np.frombuffer(out, dtype=np.float32).reshape(nZ, nA, N)
+
+    def backward_occ(self, sino_zad: np.ndarray, angles_deg: np.ndarray,
+                     occ_zad: np.ndarray) -> np.ndarray:
+        """Occlusion-aware backward.  sino (nZ,nA,N), occ (nZ,nA,N) -> (nZ,N,N).
+
+        No pi/(2*nA) scaling -- matches Projector3DParallelPython.backward."""
+        nZ, nA, N = sino_zad.shape
+        sino = np.ascontiguousarray(sino_zad, dtype=np.float32)
+        occ = np.ascontiguousarray(occ_zad, dtype=np.float32)
+        cossin = self._cossin(angles_deg)
+        dims = np.array([N, nA, nZ], dtype=np.int32)
+        out = self.dev.buffer(nZ * N * N * 4)
+        self._bwd_occ(nZ * N * N, sino, cossin, dims, occ, out)
         return np.frombuffer(out, dtype=np.float32).reshape(nZ, N, N)

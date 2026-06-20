@@ -23,6 +23,7 @@ from vamtoolbox.projector.Projector3DParallelMetal import (  # noqa: E402
 )
 from vamtoolbox.projector.Projector3DParallel import (  # noqa: E402
     Projector3DParallelSkimage,
+    Projector3DParallelPython,
 )
 
 
@@ -135,3 +136,76 @@ def test_optimize_runs_through_metal():
     tgt = vol > 0.5
     # in-target dose should sit clearly above background
     assert d[tgt].mean() > d[~tgt].mean() + 0.2
+
+
+# --------------------------------------------------------------------------- #
+# Occlusion (insert shadowing) path vs the Python reference projector
+# --------------------------------------------------------------------------- #
+def _occ_geo(N=72, nZ=6, nA=90):
+    vol = np.zeros((N, N, nZ), np.float32)
+    yy, xx = np.mgrid[:N, :N]
+    r2 = (xx - N // 2) ** 2 + (yy - N // 2) ** 2
+    vol[(r2 < (N // 3) ** 2) & (r2 > (N // 6) ** 2), :] = 1.0  # ring target
+    insert = np.zeros((N, N, nZ), np.float32)
+    insert[((xx - N // 2 - 12) ** 2 + (yy - N // 2) ** 2) < 6 ** 2, :] = 1.0
+    tg = vam.geometry.TargetGeometry(target=vol, resolution=N)
+    angles = np.linspace(0, 360 - 360 / nA, nA)
+    pg = vam.geometry.ProjectionGeometry(angles, ray_type="parallel", CUDA=False)
+    pg.attenuation_field = np.where(insert == 1, np.inf, 0)
+    return vol, tg, pg
+
+
+def test_occlusion_sinogram_matches_python():
+    vol, tg, pg = _occ_geo()
+    met = Projector3DParallelMetal(tg, pg)
+    py = Projector3DParallelPython(tg, pg)
+    assert met.occ is not None                       # occlusion path active
+    mo = np.transpose(met.occ, (2, 1, 0))            # -> (N, nA, nZ) like python
+    mo = np.where(mo >= 0.5e9, np.nan, mo)
+    po = py.occ_sinogram
+    both = ~np.isnan(po) & ~np.isnan(mo)
+    # identical edge depths where both see the insert, identical miss pattern
+    assert np.array_equal(np.isnan(po), np.isnan(mo))
+    assert np.abs(po[both] - mo[both]).max() < 1e-3
+
+
+def test_occlusion_forward_matches_python():
+    vol, tg, pg = _occ_geo()
+    met = Projector3DParallelMetal(tg, pg)
+    py = Projector3DParallelPython(tg, pg)
+    bm = met.forward(vol)
+    bp = py.forward(vol)
+    assert np.abs(bm - bp).max() / (bp.max() + 1e-9) < 1e-3
+
+
+def test_constructor_selects_metal_for_insert():
+    _, tg, pg = _occ_geo()
+    A = vam.projectorconstructor.projectorconstructor(tg, pg)
+    assert type(A).__name__ == "Projector3DParallelMetal"
+
+
+def test_optimize_with_insert_matches_python():
+    vol, tg, pg = _occ_geo(nZ=8)
+    angles = pg.angles
+    insert_field = np.where(pg.attenuation_field > 0, np.inf, 0)
+
+    def opt():
+        return vam.optimize.Options(method="OSMO", n_iter=10, d_h=0.85,
+                                    d_l=0.6, filter="hamming", verbose=False)
+
+    pg_m = vam.geometry.ProjectionGeometry(angles, ray_type="parallel", CUDA=False)
+    pg_m.attenuation_field = insert_field.copy()
+    A_m = vam.projectorconstructor.projectorconstructor(tg, pg_m)
+    assert type(A_m).__name__ == "Projector3DParallelMetal"
+    _, recon_m, _ = vam.optimize.optimize(tg, pg_m, opt())
+
+    pg_p = vam.geometry.ProjectionGeometry(angles, ray_type="parallel", CUDA=False)
+    pg_p.attenuation_field = insert_field.copy()
+    pg_p.metal = False
+    A_p = vam.projectorconstructor.projectorconstructor(tg, pg_p)
+    assert type(A_p).__name__ == "Projector3DParallelPython"
+    _, recon_p, _ = vam.optimize.optimize(tg, pg_p, opt())
+
+    # functionally equivalent reconstructions (boundary voxels aside)
+    c = np.corrcoef(recon_m.array.ravel(), recon_p.array.ravel())[0, 1]
+    assert c > 0.99
