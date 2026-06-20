@@ -155,6 +155,40 @@ def test_all_mode_forces_print(tmp_path):
     assert (arr > 0).any() and insert is None and zero is None
 
 
+def _write_cube(path, name="cube", s=10.0):
+    w = lib3mf.Wrapper()
+    model = w.CreateModel()
+    mesh = model.AddMeshObject()
+    mesh.SetName(name)
+    corners = [(0, 0, 0), (s, 0, 0), (s, s, 0), (0, s, 0),
+               (0, 0, s), (s, 0, s), (s, s, s), (0, s, s)]
+    for (x, y, z) in corners:
+        p = lib3mf.Position()
+        p.Coordinates = (float(x), float(y), float(z))
+        mesh.AddVertex(p)
+    faces = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+             (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    for (a, b, c) in faces:
+        tri = lib3mf.Triangle()
+        tri.Indices = (a, b, c)
+        mesh.AddTriangle(tri)
+    model.AddBuildItem(mesh, w.GetIdentityTransform())
+    model.QueryWriter("3mf").WriteToFile(str(path))
+
+
+def test_solid_mesh_voxelizes_filled(tmp_path):
+    """The scanline (no-rtree) mesh voxelizer fills a cube's interior."""
+    p = tmp_path / "cube.3mf"
+    _write_cube(p, "shell_block", s=10.0)
+    arr, _, _ = threemf.voxelize_3mf(str(p), resolution=40)
+    ys, xs, zs = np.where(arr > 0)
+    assert arr.sum() > 0
+    # central slice of the cube must be a filled square, not a hollow ring
+    zc = (zs.min() + zs.max()) // 2
+    block = arr[ys.min():ys.max() + 1, xs.min():xs.max() + 1, zc]
+    assert block.mean() > 0.95
+
+
 def test_targetgeometry_defaults_to_auto(tmp_path):
     p = tmp_path / "multi.3mf"
     _write_named_lattices(p, ["lattice_infill", "insert_pin", "zerodose_channel"])
