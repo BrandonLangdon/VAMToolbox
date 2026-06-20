@@ -179,19 +179,55 @@ def projectorconstructor(
                     A = Projector3DParallelPython(target_geo, proj_geo)
 
             else:
+                metal_pref = getattr(proj_geo, "metal", None)
+                use_metal = metal_pref is not False and (
+                    proj_geo.ray_type == "parallel"
+                    and getattr(proj_geo, "inclination_angle", None) in (None, 0)
+                    and getattr(proj_geo, "attenuation_field", None) is None
+                    and hardware._metal_ok()
+                )
                 if target_geo.n_dim == 2:
-                    try:
-                        from vamtoolbox.projector.Projector2DParallel import (
-                            Projector2DParallelAstra,
-                        )
-                        A = Projector2DParallelAstra(target_geo, proj_geo)
-                    except (ImportError, AttributeError):
-                        from vamtoolbox.projector.Projector2DParallel import (
-                            Projector2DParallelSkimage,
-                        )
-                        A = Projector2DParallelSkimage(target_geo, proj_geo)
+                    A = None
+                    # Apple Metal GPU projector (Apple Silicon), preferred when
+                    # available.  Set proj_geo.metal = False to disable.
+                    if use_metal:
+                        try:
+                            from vamtoolbox.projector.Projector3DParallelMetal import (
+                                Projector2DParallelMetal,
+                            )
+                            A = Projector2DParallelMetal(target_geo, proj_geo)
+                        except Exception as e:
+                            print(f"  [projectorconstructor] Metal projector "
+                                  f"unavailable ({e}); falling back to CPU.")
+                            A = None
+                    if A is None:
+                        try:
+                            from vamtoolbox.projector.Projector2DParallel import (
+                                Projector2DParallelAstra,
+                            )
+                            A = Projector2DParallelAstra(target_geo, proj_geo)
+                        except (ImportError, AttributeError):
+                            from vamtoolbox.projector.Projector2DParallel import (
+                                Projector2DParallelSkimage,
+                            )
+                            A = Projector2DParallelSkimage(target_geo, proj_geo)
 
                 else:
+                    A = None
+                    # Apple Metal GPU projector (Apple Silicon): matches the
+                    # skimage convention and is far faster than the CPU paths.
+                    # Preferred when a Metal device is available.  Set
+                    # proj_geo.metal = False to disable.
+                    if use_metal:
+                        try:
+                            from vamtoolbox.projector.Projector3DParallelMetal import (
+                                Projector3DParallelMetal,
+                            )
+                            A = Projector3DParallelMetal(target_geo, proj_geo)
+                        except Exception as e:
+                            print(f"  [projectorconstructor] Metal projector "
+                                  f"unavailable ({e}); falling back to CPU.")
+                            A = None
                     # Default CPU 3D parallel projector: precomputed astra-built
                     # sparse system matrix (~5x faster than skimage radon, and it
                     # matches the astra-CUDA/GPU convention).  Falls back to skimage
@@ -203,8 +239,7 @@ def projectorconstructor(
                         and getattr(proj_geo, "inclination_angle", None) in (None, 0)
                         and getattr(proj_geo, "attenuation_field", None) is None
                     )
-                    A = None
-                    if use_sparse:
+                    if A is None and use_sparse:
                         try:
                             from vamtoolbox.projector.Projector3DParallel import (
                                 Projector3DParallelSparse,
