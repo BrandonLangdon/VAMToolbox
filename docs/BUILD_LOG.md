@@ -1,22 +1,20 @@
-# Build Log
+# VAMToolbox — Build Log
 
-A running record of the **decisions** made while extending VAMToolbox (and its
-sibling tools) — what was chosen, why, and what was rejected — so the reasoning
-is recoverable later without re-reading every diff.
+A running record of the **decisions** made in this repo (the core tomography
+engine: voxelization, optimizers, projectors) — what was chosen, why, and what
+was rejected — so the reasoning is recoverable without re-reading every diff.
 
-**Scope.** This effort spans several repos that work together:
-
-| Repo | Role |
-|---|---|
-| **VAMToolbox** (this repo, GitHub) | Core tomography engine: voxelization, optimizers, projectors |
-| **voxelcast** (GitHub) | PySide6 desktop GUI to drive/visualize VAMToolbox |
-| **Blender3MFExporter** (Codeberg) | Blender add-on that writes role-tagged 3MF (model + lattice + inserts) |
-| **VolumeFillingLattice / VFL** (Codeberg) | Blender add-on that generates beam lattices |
+**Per-repo logs.** Each repo in this effort keeps its own `BUILD_LOG.md`:
+- **VAMToolbox** (this file) — engine
+- **voxelcast** — PySide6 GUI that drives VAMToolbox
+- **Blender3MFExporter** — Blender add-on writing role-tagged 3MF
+- **VolumeFillingLattice / VFL** — Blender add-on generating beam lattices
 
 **How to use this file.** Append a dated entry per meaningful decision. Keep the
 format: *Context → Decision → Why → Alternatives considered → Status*. Record the
 *why* and the roads not taken — the code already shows the *what*. Do not put
-secrets here (tokens, credentials).
+secrets here (tokens, credentials). Decisions that belong to a sibling repo go in
+that repo's log.
 
 ---
 
@@ -50,33 +48,6 @@ Metal entry below, which we only reached once the CPU path proved the pipeline).
 
 ---
 
-## 2026-06 — VoxelCast: a desktop GUI for VAMToolbox
-
-**Context.** Needed to *see* 2D/3D targets, sinograms, and reconstructions, and to
-import STL files and run the engine interactively.
-
-**Decision.** A separate PySide6 app (`voxelcast`) with **dual coupling**: it can
-import `vamtoolbox` directly (in-process optimize on a `QThread`) *and* load saved
-result files. 2D via pyqtgraph, 3D via pyvistaqt (VTK).
-
-**Why.** A standalone GUI keeps the engine library headless and reusable; dual
-coupling supports both "run it now" and "inspect a prior run."
-
-**macOS-specific decisions (VTK/OpenGL quirks).**
-- 3D view goes blank/black on resize with MSAA → set `multi_samples=0`, and
-  render on resize/show.
-- Translucent volumes render empty at high res → added a **Surface threshold**
-  mode alongside Volume.
-- Embedded `QtInteractor` repaint is unreliable → "Open in window" uses
-  `pyvistaqt.BackgroundPlotter`; switched the native plotter to BackgroundPlotter
-  to fix a segfault when closing the pop-out + main window together.
-- The slice plane only repaints on render churn embedded — accepted as-is.
-
-**Status.** Done; works end-to-end. (A harmless teardown segfault on close was
-later resolved — see 2026-06-20.)
-
----
-
 ## 2026-06 — 3MF import to carry models + lattices + roles
 
 **Context.** Wanted to "leverage the 3MF structure for models and lattices" — a
@@ -106,21 +77,8 @@ and survive round-trips through most tools). Keeping rtree for mesh interior tes
 (rejected — install friction).
 
 **Status.** Done. `vamtoolbox/threemf.py`, wired into `TargetGeometry`
-(`.3mf` auto-routes through `stlfilename`). Surfaced in VoxelCast (STL + 3MF, role
-datasets shown). 24 tests.
-
----
-
-## 2026-06 — Blender3MFExporter: write role tags
-
-**Context.** To test the whole chain, the Blender exporter had to emit 3MF whose
-object names carry the role convention above, plus beam lattices from a Skin
-modifier.
-
-**Decision.** Write `name` onto each 3MF object resource; document the role-tag
-convention in the add-on README; add a bpy-free multi-role sample generator.
-
-**Status.** Done; pushed to Codeberg.
+(`.3mf` auto-routes through `stlfilename`). The naming-convention work is in `main`;
+the rtree-drop is PR #3. 24 tests. (GUI surfacing of 3MF lives in voxelcast's log.)
 
 ---
 
@@ -172,36 +130,9 @@ requirement.
 151²×100, 360 angles: 0.27 s vs 2.9 s per forward+backward), with no behavior
 change for existing users and no new mandatory dependency.
 
-**Known limitation (resolved 2026-06-20 — see the occlusion entry below).** As
-first shipped, Metal did not handle occlusion; a 3MF with an **insert** routed to
-the slow `Projector3DParallelPython`. This was later addressed with occlusion-aware
-Metal kernels.
-
-**Status.** Done on branch `metal-projector` (VAMToolbox), pushed to GitHub.
-`metalbackend.py`, `Projector3DParallelMetal.py`, constructor wiring,
-`hardware._metal_ok()`, README item 6, 8 new tests. Full suite: 67 passed,
-1 skipped, 1 xfailed (the pre-existing skimage-not-exact-adjoint xfail, which
-applies to Metal too since it matches skimage). **Not yet merged / PR not opened.**
-
----
-
-## 2026-06-20 — VoxelCast end-to-end check with Metal
-
-**Context.** Verify the STL and 3MF chains work through the GUI with the Metal
-changes.
-
-**Findings.**
-- `metalcompute` was missing in voxelcast's venv — without it the UI silently used
-  the CPU projector. Installed it; the UI now selects Metal.
-- STL (TacticalBlade) → OpenGL voxelize → **Metal**, 4 ms/iter.
-- 3MF lattice (no insert) → **Metal**, 47 ms/iter.
-- 3MF multi-role (insert + zero_dose) → Python attenuation projector, 5.7 s/iter
-  (see the known limitation above).
-- voxelcast test suite: 19 passed. GUI now exits cleanly (exit 0; the earlier
-  teardown segfault no longer reproduces).
-
-**Status.** Chain verified. Open follow-ups: Metal attenuation support; open the
-`metal-projector` PR.
+**Status.** Done on branch `metal-projector`, PR #4. `metalbackend.py`,
+`Projector3DParallelMetal.py`, constructor wiring, `hardware._metal_ok()`,
+README item 6, 8 new tests. Occlusion support added next (below).
 
 ---
 
