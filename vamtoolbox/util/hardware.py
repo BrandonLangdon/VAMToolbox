@@ -74,6 +74,15 @@ def _astra_cuda_ok():
         return len(_detect_gpus()) > 0
 
 
+def _metal_ok():
+    """True if an Apple Metal device + metalcompute are usable (Apple Silicon)."""
+    try:
+        from vamtoolbox.projector.metalbackend import metal_available
+        return metal_available()
+    except Exception:
+        return False
+
+
 def detect_system():
     """Probe the machine.  Returns a dict of hardware facts (never raises)."""
     logical = os.cpu_count() or 1
@@ -92,6 +101,7 @@ def detect_system():
         "ram_avail_gb": avail_gb,
         "gpus": gpus,
         "cuda": _astra_cuda_ok(),
+        "metal": _metal_ok(),
     }
 
 
@@ -102,9 +112,13 @@ def recommend_config(info=None):
         info = detect_system()
     cores = info["cpu_logical"]
     use_cuda = bool(info["cuda"] and info["gpus"])
+    # Apple Metal is the preferred CPU-alternative when CUDA is absent
+    # (e.g. Apple Silicon); the projectorconstructor selects it automatically.
+    use_metal = bool(info.get("metal") and not use_cuda)
 
     rec = {
         "use_cuda": use_cuda,
+        "use_metal": use_metal,
         # CPU projector: sparse matrix path is the fast CPU option (lever 6).
         "cpu_backend": "sparse",
         # Rebin workers: pin all cores on small boxes; leave ~2 free on big ones so
@@ -162,10 +176,18 @@ def summary(info=None, rec=None):
         for i, g in enumerate(info["gpus"]):
             lines.append(f"  GPU {i}       : {g['name']}  "
                          f"({g['vram_free_gb']} GB free / {g['vram_total_gb']} GB)")
+    elif info.get("metal"):
+        lines.append("  GPU         : Apple Metal device (metalcompute)")
     else:
         lines.append("  GPU         : none detected")
     lines.append("-" * 66)
-    lines.append(f"  -> backend     : {'CUDA (astra GPU)' if rec['use_cuda'] else 'CPU sparse-matrix'}")
+    if rec["use_cuda"]:
+        backend = "CUDA (astra GPU)"
+    elif rec.get("use_metal"):
+        backend = "Apple Metal (GPU parallel-beam)"
+    else:
+        backend = "CPU sparse-matrix"
+    lines.append(f"  -> backend     : {backend}")
     if rec["vram_budget_bytes"]:
         lines.append(f"  -> VRAM budget : {rec['vram_budget_bytes'] / 1e9:.1f} GB / chunk")
     lines.append(f"  -> rebin jobs  : {rec['rebin_jobs']}  "
