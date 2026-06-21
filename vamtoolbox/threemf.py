@@ -342,23 +342,51 @@ def _fill_sphere(arr, g: _Grid, center, radius) -> None:
 
 
 def _fill_mesh(arr, g: _Grid, verts, tris) -> None:
-    """Solid voxelization of a triangle mesh via point-in-mesh containment,
-    restricted to the mesh AABB sub-grid."""
-    import trimesh
+    """Solid voxelization of a triangle mesh by z-ray parity (scanline) fill.
 
-    mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
-    lo, hi = verts.min(0), verts.max(0)
-    ix0, ix1 = _sub_range(g.xs, lo[0], hi[0])
-    iy0, iy1 = _sub_range(g.ys, lo[1], hi[1])
-    iz0, iz1 = _sub_range(g.zs, lo[2], hi[2])
-    if ix0 >= ix1 or iy0 >= iy1 or iz0 >= iz1:
-        return
-    sy, sx, sz = g.ys[iy0:iy1], g.xs[ix0:ix1], g.zs[iz0:iz1]
-    YY, XX, ZZ = np.meshgrid(sy, sx, sz, indexing="ij")
-    pts = np.stack([XX.ravel(), YY.ravel(), ZZ.ravel()], axis=-1)
-    inside = mesh.contains(pts).reshape(XX.shape)
-    sub = arr[iy0:iy1, ix0:ix1, iz0:iz1]
-    sub[inside] = 1
+    For each XY voxel column, the z-heights where the surface crosses that
+    column are collected (one per triangle covering the column), sorted, and the
+    voxels between consecutive entry/exit pairs are filled. Pure numpy -- no
+    rtree/embree/OpenGL. Best for watertight meshes (even crossing count per
+    column); robust enough for the solid shells typically paired with lattices.
+    """
+    from collections import defaultdict
+
+    xs, ys, zs = g.xs, g.ys, g.zs
+    eps = 1e-9
+    columns: dict = defaultdict(list)   # (iy, ix) -> [z crossing, ...]
+
+    for tri in verts[tris]:
+        p0, p1, p2 = tri
+        xmin, xmax = min(p0[0], p1[0], p2[0]), max(p0[0], p1[0], p2[0])
+        ymin, ymax = min(p0[1], p1[1], p2[1]), max(p0[1], p1[1], p2[1])
+        ix0, ix1 = _sub_range(xs, xmin, xmax)
+        iy0, iy1 = _sub_range(ys, ymin, ymax)
+        if ix0 >= ix1 or iy0 >= iy1:
+            continue
+        denom = (p1[1] - p2[1]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (p0[1] - p2[1])
+        if abs(denom) < 1e-12:           # degenerate triangle in XY
+            continue
+        GY, GX = np.meshgrid(ys[iy0:iy1], xs[ix0:ix1], indexing="ij")
+        a = ((p1[1] - p2[1]) * (GX - p2[0]) + (p2[0] - p1[0]) * (GY - p2[1])) / denom
+        b = ((p2[1] - p0[1]) * (GX - p2[0]) + (p0[0] - p2[0]) * (GY - p2[1])) / denom
+        c = 1.0 - a - b
+        inside = (a >= -eps) & (b >= -eps) & (c >= -eps)
+        if not inside.any():
+            continue
+        Z = a * p0[2] + b * p1[2] + c * p2[2]
+        iys, ixs = np.nonzero(inside)
+        zvals = Z[iys, ixs]
+        for ky, kx, z in zip(iys, ixs, zvals):
+            columns[(iy0 + int(ky), ix0 + int(kx))].append(float(z))
+
+    for (iy, ix), zlist in columns.items():
+        zlist.sort()
+        for k in range(0, len(zlist) - 1, 2):
+            iz0 = int(np.searchsorted(zs, zlist[k], side="left"))
+            iz1 = int(np.searchsorted(zs, zlist[k + 1], side="right"))
+            if iz1 > iz0:
+                arr[iy, ix, iz0:iz1] = 1
 
 
 def _fill_body(arr, g: _Grid, body: Body) -> None:
