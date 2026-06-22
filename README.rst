@@ -45,13 +45,17 @@ This release adds a high-level pipeline API, a desktop GUI (Tomo), large-part/hi
 
 5. Hardware detection (new ``vamtoolbox/util/hardware.py``)
 
-   CUDA capability detection and auto-tuning of run parameters, with a CPU fallback.
+   CUDA capability detection and auto-tuning of run parameters, with a CPU fallback. On Apple Silicon, Metal availability is also detected (``hardware._metal_ok()``).
 
-6. Native install, ASTRA backend, and a one-command installer (conda deprecated)
+6. Apple Metal GPU projector (new ``vamtoolbox/projector/metalbackend.py`` + ``Projector3DParallelMetal.py``)
+
+   A parallel-beam forward/back projector that runs on the Apple GPU via Metal, for Macs where the CUDA/ASTRA backend is unavailable. The two Metal compute kernels reproduce the scikit-image ``radon(circle=True)`` / ``iradon(filter_name=None, circle=True)`` geometry and scaling exactly, so it is a drop-in replacement for the CPU projector (~10× faster than the parallelized skimage path on an M1). **Insert occlusion** (shadow casting) is also supported on Metal — a drop-in for the slow ``Projector3DParallelPython`` that is ~40× faster (functionally equivalent, recon correlation > 0.999). ``projectorconstructor`` selects the Metal projector automatically when a Metal device is present and CUDA is not, for both the plain and occlusion cases; set ``proj_geo.metal = False`` to opt out. Requires the optional ``metalcompute`` package (macOS/arm64 only — see ``requirements-py313.txt``); absent that, VAMToolbox falls back to the sparse/skimage/Python CPU projectors.
+
+7. Native install, ASTRA backend, and a one-command installer (conda deprecated)
 
    VAMToolbox uses the `ASTRA Toolbox <https://astra-toolbox.com>`_ as its CUDA tomography backend for the projection/reconstruction operators. **conda is now deprecated** as the install path; VAMToolbox installs natively into a plain ``pip``/venv environment on **Python 3.13**. ASTRA is installed from the standalone, CUDA-bundled download on the `ASTRA Toolbox site <https://astra-toolbox.com/downloads/>`_ rather than a conda channel. A new ``install.ps1`` script at the repo root does the whole setup in one command — creates the venv, downloads and installs ASTRA (and its VC++ redistributable), installs ``requirements-py313.txt`` and VAMToolbox, and verifies CUDA. This is also how the bundled Tomo runtime ships ASTRA. See `Installation`_.
 
-7. Cleanup and packaging
+8. Cleanup and packaging
 
    ``torch`` is now an optional dependency — the imports in ``vamtoolbox/__init__.py`` and ``vamtoolbox/projector/__init__.py`` are guarded so the OSMO/BCLP + ASTRA/sparse path runs without torch installed (enabling a much slimmer bundled runtime). Added Python 3.13 support (``requirements-py313.txt``), a ``pytest`` test suite under ``tests/``, and additional usage examples under ``examples/``.
 
