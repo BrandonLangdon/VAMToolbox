@@ -178,6 +178,35 @@ constructor wiring, README item 6 updated, 4 new tests. Full suite: 70 passed,
 1 skipped, 1 xfailed.
 
 ---
+
+## 2026-06-21 — Known limitations & choices for future review
+
+Captured before pausing the project (pending a physical printer to validate
+against). None are regressions; they are pre-existing engine gaps or deliberate
+scope cuts to revisit later.
+
+**CUDA GPU branch does not support attenuation/occlusion (inserts).** When
+`attenuation_field` is set (i.e. a part has an insert), `projectorconstructor`'s
+`use_gpu` branch raises `NotImplementedError` (2D and 3D). So insert / occlusion
+parts run only on the CPU (`Projector3DParallelPython`) or Apple Metal
+(occlusion kernels) paths — never on CUDA. *Future:* implement a CUDA (astra)
+occlusion/attenuation projector, or formally document that inserts require the
+CPU/Metal path.
+
+**CAL is in the engine but not the high-level pipeline.** `optimize.Options`
+supports `method="CAL"`, but `VAMPipeline`/`PrintConfig` wire only OSMO and BCLP,
+so any GUI on the pipeline (incl. VoxelCast's guided flow) can't select CAL.
+*Future:* add CAL to `PrintConfig`/pipeline if a GUI needs it.
+
+**Metal occlusion deliberately skips the Beer–Lambert absorption mask** (and uses
+no `π/(2·nA)` backward scaling) to exactly match `Projector3DParallelPython`. So
+combined continuous-absorption *and* insert-occlusion isn't modelled on any
+backend today. *Future:* if that combination is needed, add it to the Python and
+Metal occlusion paths together so they stay equivalent.
+
+**Status.** Noted; deferred until hardware is available to validate end-to-end.
+
+---
 ```
 Template for new entries:
 
