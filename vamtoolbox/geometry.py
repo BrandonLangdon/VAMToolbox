@@ -489,6 +489,7 @@ class TargetGeometry(Volume):
         binarize_image=True,
         clip_to_circle=True,
         options=None,
+        progress=None,
     ):
         """
         Parameters
@@ -583,7 +584,7 @@ class TargetGeometry(Volume):
             self.stlfilename = stlfilename
             array, insert, zero_dose = vamtoolbox.voxelize.voxelizeTargetOpenGL(
                 stlfilename, resolution, bodies if bodies is not None else "all",
-                rot_angles
+                rot_angles, progress=progress
             )
             self.zero_dose = zero_dose
             self.insert = insert
@@ -594,7 +595,7 @@ class TargetGeometry(Volume):
             self.threemffilename = threemffilename
             array, insert, zero_dose = vamtoolbox.threemf.voxelize_3mf(
                 threemffilename, resolution, bodies if bodies is not None else "auto",
-                rot_angles
+                rot_angles, progress=progress
             )
             self.zero_dose = zero_dose
             self.insert = insert

@@ -132,6 +132,7 @@ class Voxelizer:
         square_xy: bool = True,
         store_voxel_array: bool = False,
         slice_save_path: str | None = None,
+        progress=None,
     ):
         """
         Parameters
@@ -159,6 +160,10 @@ class Voxelizer:
         slice_save_path : str, optional
             file path to directory in which to save .png images of each slice
 
+        progress : callable, optional
+            called as progress(done, total) after each Z slice; lets a GUI show
+            voxelization progress (the slicer otherwise blocks the caller).
+
         Returns
         -------
         voxel_array : np.ndarray
@@ -177,6 +182,7 @@ class Voxelizer:
             slice_save_path=slice_save_path,
             value=voxel_value,
             dtype=voxel_dtype,
+            progress=progress,
         )
 
         if store_voxel_array == True:
@@ -329,6 +335,7 @@ class OpenGLSlicer:
         slice_save_path: str | None = None,
         value=1.0,
         dtype: np.typing.DTypeLike = "uint8",
+        progress=None,
     ):
         """
         Parameters
@@ -432,6 +439,9 @@ class OpenGLSlicer:
             translation += layer_thickness
 
             self._drawWindow()
+
+            if progress is not None:
+                progress(i + 1, length_z_voxels)
 
         return voxel_array
 
@@ -609,7 +619,8 @@ class OpenGLSlicer:
         return np.copy(data_numpy)
 
 
-def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0, 0]):
+def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0, 0],
+                         progress=None):
     """
     OpenGL-based replacement for voxelizeTarget.
 
@@ -631,6 +642,9 @@ def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0,
                 Example: {"print": [2], "insert": [1]}
     rot_angles : list of float
         Rotation angles in degrees around (x, y, z) axes.
+    progress : callable, optional
+        called as progress(done, total, label) while slicing each body group;
+        lets a GUI report voxelization progress instead of appearing frozen.
 
     Returns
     -------
@@ -680,7 +694,7 @@ def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0,
     finally:
         os.unlink(full_path)
 
-    def _voxelize_group(indices):
+    def _voxelize_group(indices, label="voxelizing"):
         """Merge the selected components and voxelize using the global bounds."""
         if not indices:
             return None
@@ -688,16 +702,18 @@ def voxelizeTargetOpenGL(input_path, resolution, bodies="all", rot_angles=[0, 0,
         # Directly assign the BodyMesh so the already-established global bounds
         # are preserved (addMeshes would recompute and potentially shrink them).
         v.meshes["_group"] = BodyMesh(group)
-        return v.voxelize("_group", layer_thickness=lt, voxel_value=1, voxel_dtype="uint8")
+        cb = None if progress is None else (lambda d, t: progress(d, t, label))
+        return v.voxelize("_group", layer_thickness=lt, voxel_value=1,
+                          voxel_dtype="uint8", progress=cb)
 
     if bodies == "all":
         arr_print     = _voxelize_group(list(range(1, len(fixed) + 1)))
         arr_insert    = None
         arr_zero_dose = None
     else:
-        arr_print     = _voxelize_group(bodies.get("print", []))
-        arr_insert    = _voxelize_group(bodies.get("insert", []))
-        arr_zero_dose = _voxelize_group(bodies.get("zero_dose", []))
+        arr_print     = _voxelize_group(bodies.get("print", []), "print")
+        arr_insert    = _voxelize_group(bodies.get("insert", []), "insert")
+        arr_zero_dose = _voxelize_group(bodies.get("zero_dose", []), "zero-dose")
 
     return arr_print, arr_insert, arr_zero_dose
 

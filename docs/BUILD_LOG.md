@@ -207,6 +207,36 @@ Metal occlusion paths together so they stay equivalent.
 **Status.** Noted; deferred until hardware is available to validate end-to-end.
 
 ---
+
+## 2026-06-27 — Voxelizer progress callback
+
+**Context.** Voxelization is the one long step that *must* run on the caller's
+thread (the OpenGL slicer needs the main thread; the analytic 3MF voxelizer is a
+plain Python loop). A GUI driving it (VoxelCast) had no way to show progress, so
+the app looked frozen on big parts.
+
+**Decision.** Thread an optional `progress(done, total, label)` callback through
+the voxelizers: `OpenGLSlicer.slice` → `Voxelizer.voxelize` →
+`voxelizeTargetOpenGL` for STL (fires per Z slice), and `voxelize_3mf` →
+`_vox_group` for 3MF (fires per body). `TargetGeometry.__init__` gains a
+`progress=` param that forwards to whichever path runs. `label` is the body
+group being sliced (`print` / `insert` / `zero-dose`, or `voxelizing` for the
+single "all" group).
+
+**Why.** A callback keeps the engine UI-agnostic (no Qt dependency) while letting
+a caller report progress *and* pump its event loop between slices. tqdm still
+prints for CLI users; the callback is purely additive and defaults to `None`, so
+every existing call site is unchanged.
+
+**Alternatives considered.** Moving voxelization to a worker thread (rejected —
+OpenGL contexts are main-thread-bound on macOS). Emitting Qt signals from the
+engine (rejected — couples the engine to Qt). Parsing tqdm output (rejected —
+brittle).
+
+**Status.** Done. New test `test_voxelize_reports_progress` (3MF path, no display
+needed); STL path verified via a headless smoke test.
+
+---
 ```
 Template for new entries:
 

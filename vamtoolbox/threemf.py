@@ -430,17 +430,20 @@ def _assign_groups(bodies: list[Body], bodies_map) -> dict:
     return groups
 
 
-def _vox_group(bodies: list[Body], g: _Grid) -> np.ndarray | None:
+def _vox_group(bodies: list[Body], g: _Grid, progress=None,
+               label="voxelizing") -> np.ndarray | None:
     if not bodies:
         return None
     arr = np.zeros(g.shape, dtype=np.uint8)
-    for b in bodies:
+    for i, b in enumerate(bodies):
         _fill_body(arr, g, b)
+        if progress is not None:
+            progress(i + 1, len(bodies), label)
     return arr
 
 
 def voxelize_3mf(path: str, resolution: int, bodies="auto",
-                 rot_angles=(0, 0, 0)):
+                 rot_angles=(0, 0, 0), progress=None):
     """Voxelize a 3MF (beam lattices + solid meshes) into VAMToolbox target arrays.
 
     Drop-in analogue of voxelize.voxelizeTargetOpenGL: returns
@@ -449,6 +452,9 @@ def voxelize_3mf(path: str, resolution: int, bodies="auto",
     `bodies` defaults to "auto" (assign roles by the object-name convention,
     see role_from_name). Pass "all" to force every object into the print target,
     or a dict to map explicitly.
+
+    `progress`, if given, is called as progress(done, total, label) per body so
+    a GUI can report progress instead of appearing frozen.
     """
     parsed = read_3mf(path)
     if not parsed:
@@ -459,9 +465,9 @@ def voxelize_3mf(path: str, resolution: int, bodies="auto",
             b.vertices = b.vertices @ R.T
     grid = _build_grid(parsed, resolution)
     groups = _assign_groups(parsed, bodies)
-    arr_print = _vox_group(groups["print"], grid)
+    arr_print = _vox_group(groups["print"], grid, progress, "print")
     if arr_print is None:  # no object mapped to print -> empty target
         arr_print = np.zeros(grid.shape, dtype=np.uint8)
-    arr_insert = _vox_group(groups["insert"], grid)
-    arr_zero = _vox_group(groups["zero_dose"], grid)
+    arr_insert = _vox_group(groups["insert"], grid, progress, "insert")
+    arr_zero = _vox_group(groups["zero_dose"], grid, progress, "zero-dose")
     return arr_print, arr_insert, arr_zero

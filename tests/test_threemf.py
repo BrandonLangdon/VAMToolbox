@@ -58,6 +58,19 @@ def test_voxelize_shape_and_fill(tmp_path):
     assert arr.dtype == np.uint8
 
 
+def test_voxelize_reports_progress(tmp_path):
+    """voxelize_3mf streams progress(done, total, label) so a GUI can show it."""
+    p = tmp_path / "lat.3mf"
+    _write_tetra_lattice(p)
+    calls = []
+    threemf.voxelize_3mf(str(p), resolution=40,
+                         progress=lambda d, t, label="": calls.append((d, t, label)))
+    assert calls, "progress was never called"
+    assert calls[-1][0] == calls[-1][1]                 # ends at total
+    assert all(d <= t for d, t, _ in calls)             # never exceeds total
+    assert {lbl for _, _, lbl in calls} <= {"print", "insert", "zero-dose"}
+
+
 def test_capsule_hits_segment(tmp_path):
     """A single horizontal beam: voxels near the segment must be filled."""
     w = lib3mf.Wrapper()
